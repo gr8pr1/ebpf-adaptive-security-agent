@@ -25,7 +25,9 @@ import (
 	"ebpf-agent/internal/aggregator"
 	"ebpf-agent/internal/config"
 	"ebpf-agent/internal/enricher"
+	"ebpf-agent/internal/ringbuf"
 	"ebpf-agent/internal/scorer"
+	"ebpf-agent/internal/version"
 )
 
 // Client holds OTel providers and emit helpers.
@@ -54,7 +56,7 @@ func Init(ctx context.Context, cfg config.OTelConfig, hostID string, hostLabels 
 
 	attrs := []attribute.KeyValue{
 		semconv.ServiceNameKey.String("ebpf-agent"),
-		semconv.ServiceVersionKey.String("3.0.0"),
+		semconv.ServiceVersionKey.String(version.Version),
 		attribute.String("host.id", hostID),
 		attribute.String("host.name", hostID),
 	}
@@ -162,16 +164,16 @@ func (c *Client) EmitAnomaly(ctx context.Context, r scorer.Result, w *aggregator
 	span.End()
 }
 
-// EmitSecurityEvent is a placeholder for OTLP log export; high-value events are traced when tracing is enabled.
+// EmitSecurityEvent exports a high-value security event as a span when tracing is enabled.
 func (c *Client) EmitSecurityEvent(ctx context.Context, ev *enricher.EnrichedEvent) {
 	if c == nil || c.tracer == nil {
 		return
 	}
-	rate := sampleRate(c.sampling, ev.Raw.EventType)
+	rate := SampleRate(c.sampling, ev.Raw.EventType, ev.Raw.Flags)
 	if rate <= 0 {
 		return
 	}
-	if rate < 1.0 && (int(ev.Raw.TimestampNs)%1000) > int(rate*1000) {
+	if rate < 1.0 && !shouldSample(ev.Raw.TimestampNs, rate) {
 		return
 	}
 	attrs := []attribute.KeyValue{
@@ -188,24 +190,62 @@ func (c *Client) EmitSecurityEvent(ctx context.Context, ev *enricher.EnrichedEve
 	span.End()
 }
 
-func sampleRate(m map[string]float64, eventType uint8) float64 {
-	key := "exec"
-	switch eventType {
-	case 3:
-		key = "ptrace"
-	case 2:
-		key = "connect"
-	case 9:
-		key = "bind"
-	case 10:
-		key = "dns"
-	case 4:
-		key = "sensitive_file"
-	}
+func shouldSample(timestampNs uint64, rate float64) bool {
+	bucket := int(timestampNs % 1000)
+	return bucket < int(rate*1000)
+}
+
+// SampleRate resolves the sampling rate for an event type and flags.
+func SampleRate(m map[string]float64, eventType uint8, flags uint8) float64 {
+	key := samplingKey(eventType, flags)
 	if r, ok := m[key]; ok {
 		return r
 	}
 	return 0.01
+}
+
+func samplingKey(eventType uint8, flags uint8) string {
+	switch eventType {
+	case ringbuf.EventPtrace:
+		return "ptrace"
+	case ringbuf.EventConnect:
+		if flags&ringbuf.FlagSuspiciousPort != 0 {
+			return "suspicious_connect"
+		}
+		return "connect"
+	case ringbuf.EventBind:
+		return "bind"
+	case ringbuf.EventDNS:
+		return "dns"
+	case ringbuf.EventOpenat:
+		if flags&ringbuf.FlagPasswdRead != 0 {
+			return "passwd_read"
+		}
+		if flags&ringbuf.FlagSensitiveFile != 0 {
+			return "sensitive_file"
+		}
+		return "file_open"
+	case ringbuf.EventExec:
+		if flags&ringbuf.FlagSudo != 0 {
+			return "sudo"
+		}
+		if flags&ringbuf.FlagPasswdRead != 0 {
+			return "passwd_read"
+		}
+		return "exec"
+	case ringbuf.EventSetuid:
+		return "setuid"
+	case ringbuf.EventSetgid:
+		return "setgid"
+	case ringbuf.EventCapset:
+		return "capset"
+	case ringbuf.EventFork:
+		return "fork"
+	case ringbuf.EventExit:
+		return "exit"
+	default:
+		return "exec"
+	}
 }
 
 // Shutdown flushes and shuts down all providers.

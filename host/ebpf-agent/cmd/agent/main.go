@@ -7,9 +7,9 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"math"
 	"net/http"
 	"os/signal"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -30,6 +30,7 @@ import (
 	"ebpf-agent/internal/ringbuf"
 	"ebpf-agent/internal/scorer"
 	"ebpf-agent/internal/store"
+	"ebpf-agent/internal/version"
 )
 
 import _ "embed"
@@ -39,6 +40,7 @@ var bpfProgram []byte
 
 var eventsProcessed atomic.Int64
 var ringbufDrops atomic.Int64
+var ringbufBPFDrops atomic.Uint64
 var enrichmentFailures atomic.Int64
 var otelExportErrors atomic.Int64
 
@@ -64,6 +66,8 @@ func main() {
 	}
 	defer coll.Close()
 
+	populateSuspiciousPorts(coll, cfg.Detection.SuspiciousPorts)
+
 	var tracepoints []link.Link
 	for _, tp := range cfg.Tracepoints {
 		prog, ok := coll.Programs[tp.Program]
@@ -88,12 +92,13 @@ func main() {
 		log.Fatalf("no tracepoints attached, exiting")
 	}
 
-	// --- Agent health metrics (Prometheus, health-only) ---
+	ringbufDropsMap := coll.Maps["ringbuf_drops"]
+
 	agentInfo := prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "ebpf_agent_info",
 		Help: "Agent metadata",
 	}, []string{"host", "version"})
-	agentInfo.WithLabelValues(hostID, "3.0.0").Set(1)
+	agentInfo.WithLabelValues(hostID, version.Version).Set(1)
 
 	baselinePhaseGauge := prometheus.NewGauge(prometheus.GaugeOpts{
 		Name:        "ebpf_baseline_phase",
@@ -105,6 +110,11 @@ func main() {
 		Help:        "Learning phase progress 0.0 to 1.0",
 		ConstLabels: prometheus.Labels{"host": hostID},
 	})
+	dimensionsNotReadyGauge := prometheus.NewGauge(prometheus.GaugeOpts{
+		Name:        "ebpf_dimensions_not_ready",
+		Help:        "Dimensions whose current seasonal bucket is below minimum_samples",
+		ConstLabels: prometheus.Labels{"host": hostID},
+	})
 	eventsProcessedCounter := prometheus.NewCounterFunc(prometheus.CounterOpts{
 		Name:        "ebpf_events_processed_total",
 		Help:        "Total events processed through the pipeline",
@@ -113,9 +123,15 @@ func main() {
 
 	ringbufDropsCounter := prometheus.NewCounterFunc(prometheus.CounterOpts{
 		Name:        "ebpf_ringbuf_drops_total",
-		Help:        "Events dropped due to backpressure",
+		Help:        "Events dropped due to userspace channel backpressure",
 		ConstLabels: prometheus.Labels{"host": hostID},
 	}, func() float64 { return float64(ringbufDrops.Load()) })
+
+	ringbufBPFDropsCounter := prometheus.NewCounterFunc(prometheus.CounterOpts{
+		Name:        "ebpf_ringbuf_bpf_drops_total",
+		Help:        "Events dropped in kernel when bpf_ringbuf_reserve failed",
+		ConstLabels: prometheus.Labels{"host": hostID},
+	}, func() float64 { return float64(ringbufBPFDrops.Load()) })
 
 	enrichmentFailuresCounter := prometheus.NewCounterFunc(prometheus.CounterOpts{
 		Name:        "ebpf_enrichment_failures_total",
@@ -137,11 +153,11 @@ func main() {
 	tracepointsAttached.Set(float64(len(tracepoints)))
 
 	prometheus.MustRegister(
-		agentInfo, baselinePhaseGauge, baselineProgressGauge,
-		eventsProcessedCounter, ringbufDropsCounter, enrichmentFailuresCounter, otelExportErrorsCounter, tracepointsAttached,
+		agentInfo, baselinePhaseGauge, baselineProgressGauge, dimensionsNotReadyGauge,
+		eventsProcessedCounter, ringbufDropsCounter, ringbufBPFDropsCounter,
+		enrichmentFailuresCounter, otelExportErrorsCounter, tracepointsAttached,
 	)
 
-	// --- Baseline pipeline ---
 	blEngine := baseline.NewEngine(cfg.Baseline.EWMAAlpha, cfg.Scoring.MinimumSamples)
 
 	var st *store.Store
@@ -168,24 +184,17 @@ func main() {
 		defer scoreMu.Unlock()
 		for _, r := range results {
 			if r.Anomaly {
-				severity := r.Severity
-				if severity == "" {
-					severity = "warning"
-					if math.Abs(r.ZScore) > 5.0 {
-						severity = "critical"
-					}
-				}
 				dim := dimensionLabel(r.Key)
 				if r.ColdStart {
 					log.Printf("COLD-START [%s] %s/%s new dimension observed (count=%.0f)",
-						severity, r.Key.MetricName, dim, r.Observed)
+						r.Severity, r.Key.MetricName, dim, r.Observed)
 				} else {
 					extra := ""
 					if r.UsedMAD {
 						extra = " (MAD)"
 					}
 					log.Printf("ANOMALY [%s] %s/%s z=%.2f (mean=%.2f stddev=%.2f observed=%.0f)%s",
-						severity, r.Key.MetricName, dim, r.ZScore, r.Mean, r.StdDev, r.Observed, extra)
+						r.Severity, r.Key.MetricName, dim, r.ZScore, r.Mean, r.StdDev, r.Observed, extra)
 				}
 				if otelClient != nil && win != nil {
 					otelClient.EmitAnomaly(context.Background(), r, win)
@@ -212,7 +221,6 @@ func main() {
 		cfg.Dimensions.Scheduling,
 	)
 
-	// --- Ringbuf consumer (required for baseline pipeline) ---
 	eventsMap, hasRingbuf := coll.Maps["events"]
 	if !hasRingbuf {
 		log.Fatal("BPF collection missing ringbuf map \"events\"")
@@ -240,28 +248,27 @@ func main() {
 			for _, t := range mapping.Techniques {
 				enriched.MitreTags = append(enriched.MitreTags, t.ID)
 			}
-				if !enriched.Resolved {
-					enrichmentFailures.Add(1)
-					log.Printf("ENRICH-FAIL pid=%d comm=%s (process exited before resolution)",
-						ev.PID, ev.CommString())
-				}
+			if !enriched.Resolved {
+				enrichmentFailures.Add(1)
+				log.Printf("ENRICH-FAIL pid=%d comm=%s (process exited before resolution)",
+					ev.PID, ev.CommString())
+			}
 
-				if otelClient != nil {
-					switch enriched.Raw.EventType {
-					case ringbuf.EventPtrace, ringbuf.EventCapset:
+			if otelClient != nil {
+				switch enriched.Raw.EventType {
+				case ringbuf.EventPtrace, ringbuf.EventCapset:
+					otelClient.EmitSecurityEvent(context.Background(), enriched)
+				default:
+					if enriched.Raw.Flags&(ringbuf.FlagSuspiciousPort|ringbuf.FlagSensitiveFile|ringbuf.FlagPasswdRead) != 0 {
 						otelClient.EmitSecurityEvent(context.Background(), enriched)
-					default:
-						if enriched.Raw.Flags&(ringbuf.FlagSuspiciousPort|ringbuf.FlagSensitiveFile|ringbuf.FlagPasswdRead) != 0 {
-							otelClient.EmitSecurityEvent(context.Background(), enriched)
-						}
 					}
 				}
+			}
 
-				agg.Add(enriched)
+			agg.Add(enriched)
 		}
 	}()
 
-	// --- HTTP server (health endpoint only) ---
 	mux := http.NewServeMux()
 	handler := promhttp.Handler()
 	if cfg.Server.BasicAuth.Enabled {
@@ -289,14 +296,12 @@ func main() {
 	if phaseMgr.Phase() == phase.PhaseMonitoring {
 		phaseStr = "monitoring"
 	}
-	log.Printf("eBPF adaptive agent active — host=%s phase=%s tracepoints=%d",
-		hostID, phaseStr, len(tracepoints))
+	log.Printf("eBPF adaptive agent active — host=%s phase=%s tracepoints=%d version=%s",
+		hostID, phaseStr, len(tracepoints), version.Version)
 
-	// --- Graceful shutdown ---
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// --- Main loop ---
 	windowTicker := time.NewTicker(cfg.Baseline.AggregationWindow)
 	defer windowTicker.Stop()
 
@@ -330,12 +335,43 @@ func main() {
 		case <-healthTicker.C:
 			baselinePhaseGauge.Set(float64(phaseMgr.Phase()))
 			baselineProgressGauge.Set(phaseMgr.Progress())
+			now := time.Now()
+			dimensionsNotReadyGauge.Set(float64(blEngine.DimensionsNotReady(now.Hour(), int(now.Weekday()))))
+			if ringbufDropsMap != nil {
+				ringbufBPFDrops.Store(readBPFRingbufDrops(ringbufDropsMap))
+			}
 
 		case <-windowTicker.C:
 			w := agg.Rotate()
 			phaseMgr.ProcessWindow(w)
 		}
 	}
+}
+
+func populateSuspiciousPorts(coll *ebpf.Collection, ports []uint16) {
+	m, ok := coll.Maps["suspicious_ports"]
+	if !ok {
+		return
+	}
+	val := uint8(1)
+	for _, port := range ports {
+		if err := m.Put(port, val); err != nil {
+			log.Printf("WARN: failed to populate suspicious port %d: %v", port, err)
+		}
+	}
+}
+
+func readBPFRingbufDrops(m *ebpf.Map) uint64 {
+	var key uint32
+	var values []uint64
+	if err := m.Lookup(key, &values); err != nil {
+		return ringbufBPFDrops.Load()
+	}
+	var total uint64
+	for _, v := range values {
+		total += v
+	}
+	return total
 }
 
 func dimensionLabel(key aggregator.DimensionKey) string {
@@ -349,14 +385,7 @@ func dimensionLabel(key aggregator.DimensionKey) string {
 	if key.Container != "" {
 		parts = append(parts, "ctr:"+key.Container)
 	}
-	if len(parts) == 1 {
-		return "host"
-	}
-	result := parts[0]
-	for _, p := range parts[1:] {
-		result += "," + p
-	}
-	return result
+	return strings.Join(parts, ",")
 }
 
 func basicAuth(next http.Handler, username, password string) http.Handler {

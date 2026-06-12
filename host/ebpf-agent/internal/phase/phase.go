@@ -15,7 +15,7 @@ import (
 const metaLearningStartedAt = "learning_started_at"
 
 const (
-	PhaseLearning  = 1
+	PhaseLearning   = 1
 	PhaseMonitoring = 2
 )
 
@@ -83,7 +83,6 @@ func NewManager(
 				}
 			}
 		} else {
-			// First run: persist learning start so restarts do not reset the timer
 			m.learningStart = time.Now()
 			if err := st.SetMeta(metaLearningStartedAt, strconv.FormatInt(m.learningStart.Unix(), 10)); err != nil {
 				log.Printf("WARN: failed to persist learning_started_at: %v", err)
@@ -117,8 +116,6 @@ func (m *Manager) Progress() float64 {
 
 // ProcessWindow handles a completed aggregation window.
 func (m *Manager) ProcessWindow(w *aggregator.Window) {
-	m.engine.Ingest(w)
-
 	m.mu.Lock()
 	currentPhase := m.phase
 
@@ -128,28 +125,38 @@ func (m *Manager) ProcessWindow(w *aggregator.Window) {
 			currentPhase = PhaseMonitoring
 			log.Printf("Learning phase complete, transitioning to monitoring")
 			m.persist("monitoring")
-			// Avoid second persist from recalibration on the same window (ISSUE-009)
 			m.lastRecalib = time.Now()
-		} else {
-			m.mu.Unlock()
-			return
 		}
 	}
+	m.mu.Unlock()
 
+	if currentPhase == PhaseLearning {
+		m.engine.Ingest(w)
+		return
+	}
+
+	// Monitoring: score before ingest so cold-start and baseline stats are not poisoned.
+	results := m.scorer.Score(w)
+	if m.onScore != nil {
+		m.onScore(results, w)
+	}
+
+	skip := make(map[aggregator.DimensionKey]struct{})
+	for _, r := range results {
+		if r.Anomaly {
+			skip[r.Key] = struct{}{}
+		}
+	}
+	m.engine.IngestFiltered(w, skip)
+
+	m.mu.Lock()
 	if time.Since(m.lastRecalib) >= m.recalibInterval {
 		m.lastRecalib = time.Now()
 		m.mu.Unlock()
 		m.persist("monitoring")
-	} else {
-		m.mu.Unlock()
+		return
 	}
-
-	if currentPhase == PhaseMonitoring {
-		results := m.scorer.Score(w)
-		if m.onScore != nil {
-			m.onScore(results, w)
-		}
-	}
+	m.mu.Unlock()
 }
 
 // Reset re-enters the learning phase.

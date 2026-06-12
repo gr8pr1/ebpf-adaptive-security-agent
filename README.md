@@ -12,17 +12,17 @@ A host-adapting security monitoring agent that uses eBPF to learn normal system 
 The agent attaches eBPF programs to kernel tracepoints to observe syscalls at the kernel level. Events flow through a structured pipeline:
 
 1. **Kernel**: Tracepoint programs capture syscall metadata (pid, uid, cgroup, process name) and push structured events to a ringbuf.
-2. **Enrichment**: The Go agent drains the ringbuf, resolves pids to binaries (with LRU caching), uids to usernames, and cgroup IDs to container names.
+2. **Enrichment**: The Go agent drains the ringbuf, resolves PIDs to binaries (TTL LRU cache), UIDs to usernames (refreshed from `/etc/passwd`), and cgroup paths to container IDs where available.
 3. **MITRE Mapping**: Each enriched event is mapped to MITRE ATT&CK techniques using context-aware resolution (binary path, comm, flags, destination port).
 4. **Aggregation**: Events are bucketed into 1-minute windows per dimension (user, process, container, metric type).
-5. **Baselining**: A 168-bucket seasonal model (24 hours x 7 days) learns per-dimension means and standard deviations, with EWMA for drift adaptation.
-6. **Scoring**: Each window is scored against the baseline with a minimum stddev floor to prevent false positives on constant-value dimensions. New dimensions seen after learning are flagged via cold-start policy.
+5. **Baselining**: A 168-bucket seasonal model (24 hours x 7 days) tracks per-dimension EWMA mean and variance per hour-of-week. Neighbor buckets are used when a seasonal slot lacks enough samples.
+6. **Scoring**: In monitoring, each window is scored **before** ingest. Anomalous dimensions are not folded into the baseline. Z-score (or optional MAD) uses EWMA-blended stats with a minimum stddev floor. New dimensions post-learning trigger cold-start alerts.
 
 ### Two-Phase Operation
 
 **Phase 1 — Learning** (default: 7 days): The agent collects events and builds per-dimension, per-time-of-day baselines. High-value security events (ptrace, capset, suspicious connections) are still logged during this phase.
 
-**Phase 2 — Monitoring**: Each aggregation window is scored against the learned baseline. Anomalies are emitted to **OpenTelemetry** (when `otel.enabled`) and **journald** (severity, z-score, dimension). MITRE technique IDs are attached to enriched events; **security-event** OTLP spans include `mitre.technique.ids` when trace export is on. **Anomaly** spans carry scoring metrics (z-score, dimension, window) but not per-event MITRE tags. The baseline slowly adapts via EWMA recalibration.
+**Phase 2 — Monitoring**: Each aggregation window is scored against EWMA-blended baselines; anomalous dimension keys are excluded from ingest so bursts cannot poison statistics. Anomalies are emitted to **OpenTelemetry** (when `otel.enabled`) and **journald** (severity, z-score, dimension). High-value events (suspicious connect, sudo, sensitive file, passwd read) export at full sampling rates when OTel tracing is enabled. MITRE technique IDs are attached to enriched events; **security-event** OTLP spans include `mitre.technique.ids` when trace export is on.
 
 ## MITRE ATT&CK Coverage
 
@@ -45,7 +45,6 @@ The agent maps kernel events to MITRE techniques using enrichment context, not j
 | T1205 | Traffic Signaling | `bind()` on privileged port (<1024) | Port range check |
 | T1046 | Network Service Discovery | `bind()` on unprivileged port | Port range check |
 | T1071.004 | DNS | `sendto()` to port 53 | Port filter in BPF |
-| T1106 | Native API | `fork()` | Direct syscall |
 
 ## What It Monitors
 
@@ -109,8 +108,11 @@ baseline:
 
 scoring:
   zscore_threshold: 3.0
-  minimum_samples: 60
+  minimum_samples: 15
   cold_start_severity: warning # severity for new dimensions post-learning
+
+detection:
+  suspicious_ports: [4444, 1337, 5555, 6666, 8443, 1234, 31337]
 
 dimensions:
   per_user: true
@@ -148,7 +150,9 @@ The `/metrics` endpoint exposes agent operational health, not security detection
 | `ebpf_baseline_phase` | Gauge | 1=learning, 2=monitoring |
 | `ebpf_baseline_progress` | Gauge | 0.0-1.0 during learning |
 | `ebpf_events_processed_total` | Counter | Total events through the pipeline |
-| `ebpf_ringbuf_drops_total` | Counter | Events dropped due to backpressure |
+| `ebpf_ringbuf_drops_total` | Counter | Userspace channel-full drops |
+| `ebpf_ringbuf_bpf_drops_total` | Counter | Kernel `bpf_ringbuf_reserve` failures |
+| `ebpf_dimensions_not_ready` | Gauge | Dimensions below `minimum_samples` in current seasonal bucket |
 | `ebpf_enrichment_failures_total` | Counter | PID/binary resolution failures |
 | `ebpf_otel_export_errors_total` | Counter | OTel provider shutdown failures (incremented on `Shutdown` error) |
 | `ebpf_tracepoints_attached` | Gauge | Number of active tracepoints |
@@ -191,9 +195,10 @@ flowchart LR
     RB --> RC --> EN --> MT
     MT --> AG
     AG -->|"rotate window"| PH
-    PH --> BL
+    PH --> SC
+    SC -->|"non-anomalous only"| BL
     BL <--> ST
-    PH --> SC --> LOG
+    SC --> LOG
     PH --> HM
 ```
 
@@ -208,13 +213,15 @@ host/ebpf-agent/
 ├── internal/
 │   ├── config/                  # YAML config parsing + validation
 │   ├── ringbuf/                 # Ringbuf consumer + event parsing
-│   ├── enricher/                # PID/UID/cgroup enrichment (LRU-cached)
+│   ├── enricher/                # PID/UID/cgroup enrichment (TTL LRU cache)
 │   ├── mitre/                   # Context-aware MITRE ATT&CK mapper
 │   ├── aggregator/              # Time-window bucketing
-│   ├── baseline/                # 168-bucket seasonal model + EWMA
-│   ├── scorer/                  # Z-score anomaly detection + cold-start
-│   ├── store/                   # SQLite state persistence
-│   └── phase/                   # Learning/monitoring phase management
+│   ├── baseline/                # 168-bucket seasonal model + EWMA scoring
+│   ├── scorer/                  # Z-score / MAD anomaly detection + cold-start
+│   ├── store/                   # SQLite state persistence (WAL)
+│   ├── phase/                   # Learning/monitoring phase management
+│   ├── otelexport/              # OTLP gRPC export
+│   └── version/                 # Agent version constant
 ├── examples/prometheus/         # Health-only scrape + alert examples
 ├── config.yaml
 ├── Makefile
@@ -243,12 +250,15 @@ sudo bpftool map list
 
 ### Prometheus
 
-The agent does **not** export per-event counters or anomaly gauges to Prometheus — only **health** metrics (phase, progress, events processed, ringbuf drops, enrichment failures, OTel export errors, tracepoints attached). Use `examples/prometheus/scrape.yml` and `examples/prometheus/alerts.yml` for availability alerting. For detection output, use **OpenTelemetry** (`otel.enabled`) and/or **journald** logs.
+The agent does **not** export per-event counters or anomaly gauges to Prometheus — only **health** metrics (phase, progress, events processed, userspace/kernel ringbuf drops, dimensions not ready, enrichment failures, OTel export errors, tracepoints attached). Use `examples/prometheus/scrape.yml` and `examples/prometheus/alerts.yml` for availability alerting. For detection output, use **OpenTelemetry** (`otel.enabled`) and/or **journald** logs.
 
-## What This Doesn't Detect
+## Detection Limitations
 
 - **Packet payload inspection** — sees destination port/IP but not data content
 - **Fileless malware** — `memfd_create` + `execveat` bypasses the `execve` tracepoint
+- **Legacy/alternate file syscalls** — only `openat` is traced; `open(2)` and `openat2(2)` bypass file monitoring
+- **Path matching** — BPF uses a 64-byte path buffer; long paths, relative paths, and symlinks can evade exact string matches
+- **Failed syscalls** — `sys_enter_*` tracepoints fire before the kernel returns; EPERM/refused operations look the same as successes
 - **Cross-host correlation** — each agent is independent (planned: OTel-based fleet correlation)
 - **Kernel rootkits** — malicious kernel modules can hide events from eBPF
 - **DNS tunneling** — counts DNS queries but does not inspect query content
@@ -258,10 +268,28 @@ The agent does **not** export per-event counters or anomaly gauges to Prometheus
 
 - Requires root privileges for tracepoint attachment
 - Baseline state file (`/var/lib/ebpf-agent/baseline.db`) must be root-owned (0600) to prevent baseline poisoning
-- EWMA drift adaptation means an attacker slowly escalating over weeks could shift the baseline — set absolute ceiling thresholds alongside relative z-score detection
+- EWMA drift adaptation means an attacker slowly escalating over weeks could shift the baseline — mitigated by anomalous-window ingest gating and absolute ceiling thresholds (`scoring.ceilings`)
 - During the learning phase, high-value security events (ptrace, capset, suspicious connections) are still logged
 - Enricher PID resolution can fail for short-lived processes (TOCTOU) — failures are explicitly logged with `ENRICH-FAIL`
 - Enable TLS and basic auth on the health endpoint in production
+
+## Changelog (2026-06-12)
+
+Bug Fix Sprint — correctness and detection reliability:
+
+| Area | Change |
+|---|---|
+| **Phase / scoring** | Score before ingest in monitoring; skip anomalous dimensions from baseline (fixes dead cold-start + poisoning) |
+| **BPF** | Fix `/etc/shadow` and `/etc/sudoers` path length checks; IPv6 dest IP via stack `memcpy`; kernel `ringbuf_drops` counter |
+| **Baseline** | EWMA mean/variance used for scoring; neighbor-bucket fallback; legacy snapshot backfill on restore |
+| **OTel** | Flag-aware sampling (`suspicious_connect`, `sudo`, `passwd_read`, `sensitive_file` at 100%) |
+| **Enricher** | TTL LRU PID cache, periodic `/etc/passwd` refresh, cgroup path → container ID |
+| **MITRE** | Fork/exit no longer tagged; `passwd_read_exec` / `passwd_read_open` separate metrics |
+| **Config** | `detection.suspicious_ports` BPF map; `minimum_samples` default 15; validation for durations and basic_auth |
+| **Persistence** | SQLite WAL + busy_timeout; state file chmod 0600 on save |
+| **Tests** | `phase`, `baseline`, `otelexport`, `mitre` unit tests |
+
+Full internal changelog: `state.md` (local, not in git). Step-by-step guide: `local/HOW_IT_WORKS.md` (local, not in git).
 
 ## Contributing
 

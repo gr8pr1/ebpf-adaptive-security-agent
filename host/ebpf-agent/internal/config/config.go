@@ -93,6 +93,10 @@ type OTelBatchConfig struct {
 	ExportTimeout    time.Duration `yaml:"export_timeout"`
 }
 
+type DetectionConfig struct {
+	SuspiciousPorts []uint16 `yaml:"suspicious_ports"`
+}
+
 type Config struct {
 	Server      ServerConfig       `yaml:"server"`
 	Tracepoints []TracepointConfig `yaml:"tracepoints"`
@@ -101,6 +105,7 @@ type Config struct {
 	Host        HostConfig         `yaml:"host"`
 	Container   ContainerConfig    `yaml:"container_monitoring"`
 	Dimensions  DimensionsConfig   `yaml:"dimensions"`
+	Detection   DetectionConfig    `yaml:"detection"`
 	OTel        OTelConfig         `yaml:"otel"`
 }
 
@@ -126,9 +131,12 @@ func Load(path string) (*Config, error) {
 		},
 		Scoring: ScoringConfig{
 			ZScoreThreshold:   3.0,
-			MinimumSamples:      60,
+			MinimumSamples:    15,
 			ColdStartSeverity: "warning",
-			Ceilings:            map[string]float64{},
+			Ceilings:          map[string]float64{},
+		},
+		Detection: DetectionConfig{
+			SuspiciousPorts: []uint16{4444, 1337, 5555, 6666, 8443, 1234, 31337},
 		},
 		Container: ContainerConfig{
 			CgroupRoot: "/sys/fs/cgroup",
@@ -155,7 +163,7 @@ func Load(path string) (*Config, error) {
 			},
 			Sampling: map[string]float64{
 				"ptrace": 1.0, "suspicious_connect": 1.0, "capset": 1.0,
-				"sensitive_file": 1.0, "setuid": 1.0, "sudo": 1.0,
+				"sensitive_file": 1.0, "passwd_read": 1.0, "setuid": 1.0, "sudo": 1.0,
 				"bind": 0.1, "connect": 0.01, "dns": 0.01, "exec": 0.01,
 				"fork": 0, "exit": 0,
 			},
@@ -176,6 +184,24 @@ func Load(path string) (*Config, error) {
 
 	if cfg.Baseline.EWMAAlpha <= 0 || cfg.Baseline.EWMAAlpha >= 1 {
 		return nil, fmt.Errorf("ewma_alpha must be in (0, 1), got %f", cfg.Baseline.EWMAAlpha)
+	}
+
+	if cfg.Baseline.AggregationWindow <= 0 {
+		return nil, fmt.Errorf("aggregation_window must be positive, got %v", cfg.Baseline.AggregationWindow)
+	}
+
+	if cfg.Baseline.LearningDuration <= 0 {
+		return nil, fmt.Errorf("learning_duration must be positive, got %v", cfg.Baseline.LearningDuration)
+	}
+
+	if cfg.Scoring.MinimumSamples <= 0 {
+		return nil, fmt.Errorf("minimum_samples must be positive, got %d", cfg.Scoring.MinimumSamples)
+	}
+
+	if cfg.Server.BasicAuth.Enabled {
+		if strings.TrimSpace(cfg.Server.BasicAuth.Username) == "" || strings.TrimSpace(cfg.Server.BasicAuth.Password) == "" {
+			return nil, fmt.Errorf("basic_auth enabled but username or password is empty")
+		}
 	}
 
 	if cfg.Host.ID == "" {

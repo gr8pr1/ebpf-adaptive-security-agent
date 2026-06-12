@@ -64,14 +64,8 @@ func Map(ev *enricher.EnrichedEvent) Mapping {
 		return Mapping{Techniques: []Technique{
 			{ID: "T1071.004", Name: "DNS", Tactic: "Command and Control"},
 		}}
-	case ringbuf.EventFork:
-		return Mapping{Techniques: []Technique{
-			{ID: "T1106", Name: "Native API", Tactic: "Execution"},
-		}}
-	case ringbuf.EventExit:
-		return Mapping{Techniques: []Technique{
-			{ID: "T1106", Name: "Native API", Tactic: "Execution"},
-		}}
+	case ringbuf.EventFork, ringbuf.EventExit:
+		return Mapping{}
 	default:
 		return Mapping{}
 	}

@@ -49,6 +49,12 @@ tracepoints:
 	if cfg.Scoring.ColdStartSeverity != "warning" {
 		t.Errorf("expected default cold_start_severity 'warning', got %s", cfg.Scoring.ColdStartSeverity)
 	}
+	if cfg.Scoring.MinimumSamples != 15 {
+		t.Errorf("expected default minimum_samples 15, got %d", cfg.Scoring.MinimumSamples)
+	}
+	if len(cfg.Detection.SuspiciousPorts) == 0 {
+		t.Error("expected default suspicious_ports")
+	}
 }
 
 func TestLoadMissingFile(t *testing.T) {

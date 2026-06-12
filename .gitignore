@@ -21,6 +21,9 @@ vendor/
 # Log files
 *.log
 
+# Local-only docs (not published)
+local/
+
 # IDE
 .cursor/
 .vscode/
@@ -48,6 +51,7 @@ monitoring/Docker/compose/grafana-data/
 # Build artifacts
 dist/
 build/
+host/ebpf-agent/bpf/exec.bpf.o
 
 # Coverage reports
 coverage.txt

@@ -30,7 +30,7 @@ baseline:
 # Anomaly scoring thresholds
 scoring:
   zscore_threshold: 3.0
-  minimum_samples: 60
+  minimum_samples: 15
   cold_start_severity: warning       # severity for dimensions seen for the first time post-learning
   mad_enabled: false                 # use robust median/MAD scoring when true
   ceilings: {}                       # optional per-metric hard caps, e.g. ptrace: 10
@@ -48,6 +48,10 @@ dimensions:
   network: true
   filesystem: true
   scheduling: true
+
+# Detection tuning (kernel BPF maps populated at startup)
+detection:
+  suspicious_ports: [4444, 1337, 5555, 6666, 8443, 1234, 31337]
 
 # Tracepoints to attach eBPF programs to
 tracepoints:
@@ -112,6 +116,7 @@ otel:
     suspicious_connect: 1.0
     capset: 1.0
     sensitive_file: 1.0
+    passwd_read: 1.0
     setuid: 1.0
     sudo: 1.0
     bind: 0.1

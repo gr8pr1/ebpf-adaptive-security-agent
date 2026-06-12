@@ -159,7 +159,7 @@ func eventTypeToMetric(evType uint8, flags uint8) string {
 			return "sudo"
 		}
 		if flags&ringbuf.FlagPasswdRead != 0 {
-			return "passwd_read"
+			return "passwd_read_exec"
 		}
 		return "exec"
 	case ringbuf.EventConnect:
@@ -171,7 +171,7 @@ func eventTypeToMetric(evType uint8, flags uint8) string {
 		return "ptrace"
 	case ringbuf.EventOpenat:
 		if flags&ringbuf.FlagPasswdRead != 0 {
-			return "passwd_read"
+			return "passwd_read_open"
 		}
 		if flags&ringbuf.FlagSensitiveFile != 0 {
 			return "sensitive_file"
