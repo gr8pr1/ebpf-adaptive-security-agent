@@ -8,6 +8,8 @@ import (
 	"ebpf-agent/internal/baseline"
 )
 
+const skewnessMADThreshold = 1.0
+
 type Result struct {
 	Key       aggregator.DimensionKey
 	Observed  float64
@@ -26,6 +28,7 @@ type Scorer struct {
 	minStdDev           float64
 	coldStartSeverity   string
 	madEnabled          bool
+	autoSkewness        bool
 	ceilings            map[string]float64
 }
 
@@ -47,6 +50,7 @@ func New(engine *baseline.Engine, zscoreThreshold, minStdDev float64, coldStartS
 		minStdDev:         minStdDev,
 		coldStartSeverity: coldStartSeverity,
 		madEnabled:        madEnabled,
+		autoSkewness:      true,
 		ceilings:          ceilings,
 	}
 }
@@ -63,6 +67,11 @@ func (s *Scorer) Score(w *aggregator.Window) []Result {
 	}
 
 	for key, observed := range w.Counts {
+		_, known := knownDimensions[key]
+		if s.engine.InFastTrack(key, w.Start) && known {
+			continue
+		}
+
 		if max, ok := s.ceilings[key.MetricName]; ok && max > 0 && observed > max {
 			results = append(results, Result{
 				Key:      key,
@@ -77,6 +86,10 @@ func (s *Scorer) Score(w *aggregator.Window) []Result {
 		}
 
 		if _, known := knownDimensions[key]; !known {
+			if s.engine.InFastTrack(key, w.Start) {
+				continue
+			}
+			s.engine.StartFastTrack(key, w.Start)
 			results = append(results, Result{
 				Key:       key,
 				Observed:  observed,
@@ -87,9 +100,17 @@ func (s *Scorer) Score(w *aggregator.Window) []Result {
 			continue
 		}
 
+		useMAD := s.madEnabled
+		if s.autoSkewness {
+			skew := math.Abs(s.engine.LookupSkewness(key, hour, dow))
+			if skew > skewnessMADThreshold {
+				useMAD = true
+			}
+		}
+
 		var mean, stddev, median, mad float64
 		var ready bool
-		if s.madEnabled {
+		if useMAD {
 			mean, stddev, _, median, mad, ready = s.engine.LookupRobust(key, hour, dow)
 		} else {
 			mean, stddev, _, ready = s.engine.Lookup(key, hour, dow)
@@ -101,7 +122,7 @@ func (s *Scorer) Score(w *aggregator.Window) []Result {
 
 		var score float64
 		usedMAD := false
-		if s.madEnabled && mad > 1e-9 {
+		if useMAD && mad > 1e-9 {
 			usedMAD = true
 			score = 0.6745 * (observed - median) / mad
 		} else {
@@ -135,6 +156,9 @@ func (s *Scorer) Score(w *aggregator.Window) []Result {
 
 	for dk := range knownDimensions {
 		if _, exists := w.Counts[dk]; exists {
+			continue
+		}
+		if s.engine.InFastTrack(dk, w.Start) {
 			continue
 		}
 		mean, stddev, _, ready := s.engine.Lookup(dk, hour, dow)

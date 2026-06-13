@@ -25,7 +25,7 @@ baseline:
   ewma_alpha: 0.01
   min_stddev: 1.0                    # floor to prevent +Inf z-scores on constant dimensions
   state_file: /var/lib/ebpf-agent/baseline.db
-  new_dimension_learn_window: 24h    # reserved for fast-track learning of new dimensions
+  new_dimension_learn_window: 24h    # fast-track learning window for cold-start dimensions
 
 # Anomaly scoring thresholds
 scoring:
@@ -71,6 +71,18 @@ tracepoints:
   - group: syscalls
     name: sys_enter_openat
     program: trace_openat
+  - group: syscalls
+    name: sys_enter_open
+    program: trace_open
+  - group: syscalls
+    name: sys_enter_openat2
+    program: trace_openat2
+  - group: syscalls
+    name: sys_enter_write
+    program: trace_write
+  - group: oom
+    name: mark_victim
+    program: trace_oom_kill
   # Privilege escalation
   - group: syscalls
     name: sys_enter_setuid
@@ -125,7 +137,7 @@ otel:
     exec: 0.01
     fork: 0.0
     exit: 0.0
-  # Reserved: batch sizing is SDK default; these fields are not applied in otelexport yet
+  # OTLP gRPC batch tuning (applied to trace and log exporters)
   batch:
     max_queue_size: 8192
     max_export_batch: 512

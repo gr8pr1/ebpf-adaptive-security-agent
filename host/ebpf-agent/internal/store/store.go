@@ -12,6 +12,14 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+// BaselineSchemaVersion is incremented when snapshot JSON shape changes.
+const BaselineSchemaVersion = 2
+
+type baselinePayload struct {
+	SchemaVersion int                           `json:"schema_version"`
+	Dimensions    []baseline.DimensionSnapshot  `json:"dimensions"`
+}
+
 // Store persists baseline snapshots to SQLite.
 type Store struct {
 	db   *sql.DB
@@ -60,7 +68,6 @@ func New(path string) (*Store, error) {
 	}
 
 	if err := os.Chmod(path, 0600); err != nil && !os.IsNotExist(err) {
-		// DB file is created on first write; chmod again after first save if needed.
 		_ = err
 	}
 
@@ -68,7 +75,11 @@ func New(path string) (*Store, error) {
 }
 
 func (s *Store) SaveBaseline(snaps []baseline.DimensionSnapshot) error {
-	data, err := json.Marshal(snaps)
+	payload := baselinePayload{
+		SchemaVersion: BaselineSchemaVersion,
+		Dimensions:    snaps,
+	}
+	data, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("marshaling baseline: %w", err)
 	}
@@ -107,11 +118,21 @@ func (s *Store) LoadBaseline() ([]baseline.DimensionSnapshot, error) {
 		return nil, fmt.Errorf("reading baseline: %w", err)
 	}
 
+	// New wrapped format with schema_version.
+	var payload baselinePayload
+	if err := json.Unmarshal([]byte(data), &payload); err == nil && payload.SchemaVersion > 0 {
+		if payload.SchemaVersion != BaselineSchemaVersion {
+			return nil, fmt.Errorf("unsupported baseline schema version %d (want %d)",
+				payload.SchemaVersion, BaselineSchemaVersion)
+		}
+		return payload.Dimensions, nil
+	}
+
+	// Legacy: bare array of dimension snapshots (schema v1).
 	var snaps []baseline.DimensionSnapshot
 	if err := json.Unmarshal([]byte(data), &snaps); err != nil {
 		return nil, fmt.Errorf("unmarshaling baseline: %w", err)
 	}
-
 	return snaps, nil
 }
 

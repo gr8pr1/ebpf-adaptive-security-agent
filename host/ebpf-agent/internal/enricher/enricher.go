@@ -66,7 +66,14 @@ func New(cgroupRoot string) *Enricher {
 }
 
 func (e *Enricher) Enrich(ev *ringbuf.Event) *EnrichedEvent {
-	binary, resolved := e.resolveBinary(ev.PID)
+	var binary string
+	var resolved bool
+	if ev.EventType == ringbuf.EventExec && ev.Filename != "" {
+		binary = ev.Filename
+		resolved = true
+	} else {
+		binary, resolved = e.resolveBinary(ev.PID)
+	}
 	return &EnrichedEvent{
 		Raw:       ev,
 		Binary:    binary,

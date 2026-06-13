@@ -1,26 +1,92 @@
-# Example OpenTelemetry Collector receiving OTLP from ebpf-agent (gRPC :4317).
+# Production-hardened OpenTelemetry Collector example for ebpf-agent.
+# Routes anomaly/security signals with processor chain; tune for your backends.
+
 receivers:
   otlp:
     protocols:
       grpc:
         endpoint: 0.0.0.0:4317
-      http:
-        endpoint: 0.0.0.0:4318
+
+processors:
+  batch:
+    send_batch_size: 512
+    send_batch_max_size: 1024
+    timeout: 5s
+
+  attributes/strip_debug:
+    actions:
+      - key: ebpf.debug
+        action: delete
+
+  filter/drop_noise:
+    error_mode: ignore
+    traces:
+      span:
+        - 'attributes["ebpf.event.type_id"] == 7' # fork
+        - 'attributes["ebpf.event.type_id"] == 8' # exit
+
+  tail_sampling:
+    decision_wait: 10s
+    policies:
+      - name: anomalies-always
+        type: string_attribute
+        string_attribute:
+          key: ebpf.anomaly.severity
+          values: [warning, critical]
+      - name: security-always
+        type: string_attribute
+        string_attribute:
+          key: mitre.technique.ids
+          values: [".*"]
+          enabled_regex_matching: true
+      - name: routine-sample
+        type: probabilistic
+        probabilistic:
+          sampling_percentage: 5
 
 exporters:
   debug:
-    verbosity: detailed
-  # otlphttp:
-  #   endpoint: https://your-backend.example.com
+    verbosity: basic
+  otlp/tempo:
+    endpoint: tempo:4317
+    tls:
+      insecure: true
+  prometheus:
+    endpoint: 0.0.0.0:8889
+  loki:
+    endpoint: http://loki:3100/loki/api/v1/push
+
+connectors:
+  routing:
+    default_pipelines: [traces/routine]
+    table:
+      - context: trace
+        condition: attributes["ebpf.anomaly.severity"] != nil
+        pipelines: [traces/anomalies]
+      - context: trace
+        condition: attributes["mitre.technique.ids"] != nil
+        pipelines: [traces/security]
 
 service:
   pipelines:
-    traces:
+    traces/ingest:
       receivers: [otlp]
+      processors: [attributes/strip_debug, filter/drop_noise, tail_sampling, batch]
+      exporters: [routing]
+    traces/anomalies:
+      receivers: [routing]
+      exporters: [otlp/tempo, debug]
+    traces/security:
+      receivers: [routing]
+      exporters: [otlp/tempo, debug]
+    traces/routine:
+      receivers: [routing]
       exporters: [debug]
     metrics:
       receivers: [otlp]
-      exporters: [debug]
+      processors: [batch]
+      exporters: [prometheus, debug]
     logs:
       receivers: [otlp]
-      exporters: [debug]
+      processors: [batch]
+      exporters: [loki, debug]

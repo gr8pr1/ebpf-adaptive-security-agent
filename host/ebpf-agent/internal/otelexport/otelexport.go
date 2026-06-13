@@ -12,6 +12,7 @@ import (
 	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploggrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	"go.opentelemetry.io/otel/log"
 	"go.opentelemetry.io/otel/log/global"
 	sdklog "go.opentelemetry.io/otel/sdk/log"
 	"go.opentelemetry.io/otel/sdk/metric"
@@ -33,6 +34,7 @@ import (
 // Client holds OTel providers and emit helpers.
 type Client struct {
 	tracer        trace.Tracer
+	logger        log.Logger
 	shutdownFuncs []func(context.Context) error
 	cfg           config.OTelConfig
 	sampling      map[string]float64
@@ -89,6 +91,17 @@ func Init(ctx context.Context, cfg config.OTelConfig, hostID string, hostLabels 
 		c.sampling = map[string]float64{}
 	}
 
+	batchOpts := []sdktrace.BatchSpanProcessorOption{}
+	if cfg.Batch.MaxQueueSize > 0 {
+		batchOpts = append(batchOpts, sdktrace.WithMaxQueueSize(cfg.Batch.MaxQueueSize))
+	}
+	if cfg.Batch.MaxExportBatch > 0 {
+		batchOpts = append(batchOpts, sdktrace.WithMaxExportBatchSize(cfg.Batch.MaxExportBatch))
+	}
+	if cfg.Batch.ExportTimeout > 0 {
+		batchOpts = append(batchOpts, sdktrace.WithBatchTimeout(cfg.Batch.ExportTimeout))
+	}
+
 	if cfg.ExportTraces {
 		texp, err := otlptracegrpc.New(ctx,
 			otlptracegrpc.WithEndpoint(cfg.Endpoint),
@@ -98,7 +111,7 @@ func Init(ctx context.Context, cfg config.OTelConfig, hostID string, hostLabels 
 			return nil, fmt.Errorf("otel trace exporter: %w", err)
 		}
 		tp := sdktrace.NewTracerProvider(
-			sdktrace.WithBatcher(texp),
+			sdktrace.WithBatcher(texp, batchOpts...),
 			sdktrace.WithResource(res),
 		)
 		otel.SetTracerProvider(tp)
@@ -130,11 +143,22 @@ func Init(ctx context.Context, cfg config.OTelConfig, hostID string, hostLabels 
 		if err != nil {
 			return nil, fmt.Errorf("otel log exporter: %w", err)
 		}
+		logBatchOpts := []sdklog.BatchProcessorOption{}
+		if cfg.Batch.MaxQueueSize > 0 {
+			logBatchOpts = append(logBatchOpts, sdklog.WithMaxQueueSize(cfg.Batch.MaxQueueSize))
+		}
+		if cfg.Batch.MaxExportBatch > 0 {
+			logBatchOpts = append(logBatchOpts, sdklog.WithExportMaxBatchSize(cfg.Batch.MaxExportBatch))
+		}
+		if cfg.Batch.ExportTimeout > 0 {
+			logBatchOpts = append(logBatchOpts, sdklog.WithExportTimeout(cfg.Batch.ExportTimeout))
+		}
 		lp := sdklog.NewLoggerProvider(
-			sdklog.WithProcessor(sdklog.NewBatchProcessor(lexp)),
+			sdklog.WithProcessor(sdklog.NewBatchProcessor(lexp, logBatchOpts...)),
 			sdklog.WithResource(res),
 		)
 		global.SetLoggerProvider(lp)
+		c.logger = lp.Logger("ebpf-agent")
 		c.shutdownFuncs = append(c.shutdownFuncs, lp.Shutdown)
 	}
 
@@ -164,9 +188,9 @@ func (c *Client) EmitAnomaly(ctx context.Context, r scorer.Result, w *aggregator
 	span.End()
 }
 
-// EmitSecurityEvent exports a high-value security event as a span when tracing is enabled.
+// EmitSecurityEvent exports a high-value security event as a LogRecord (and optional trace span).
 func (c *Client) EmitSecurityEvent(ctx context.Context, ev *enricher.EnrichedEvent) {
-	if c == nil || c.tracer == nil {
+	if c == nil {
 		return
 	}
 	rate := SampleRate(c.sampling, ev.Raw.EventType, ev.Raw.Flags)
@@ -176,17 +200,53 @@ func (c *Client) EmitSecurityEvent(ctx context.Context, ev *enricher.EnrichedEve
 	if rate < 1.0 && !shouldSample(ev.Raw.TimestampNs, rate) {
 		return
 	}
-	attrs := []attribute.KeyValue{
-		attribute.Int("ebpf.event.type_id", int(ev.Raw.EventType)),
-		attribute.String("ebpf.event.comm", ev.Raw.CommString()),
-		attribute.String("ebpf.event.binary", ev.Binary),
-		attribute.String("ebpf.event.dest_ip", ev.Raw.FormatDestIP()),
-		attribute.Int("ebpf.event.dest_port", int(ev.Raw.DestPort)),
+
+	if c.logger != nil {
+		var rec log.Record
+		rec.SetTimestamp(time.Now())
+		rec.SetBody(log.StringValue("security.event"))
+		rec.SetSeverity(log.SeverityInfo)
+		rec.AddAttributes(
+			log.Int("ebpf.event.type_id", int(ev.Raw.EventType)),
+			log.String("ebpf.event.comm", ev.Raw.CommString()),
+			log.String("ebpf.event.binary", ev.Binary),
+			log.String("ebpf.event.dest_ip", ev.Raw.FormatDestIP()),
+			log.Int("ebpf.event.dest_port", int(ev.Raw.DestPort)),
+			log.Int("ebpf.event.ppid", int(ev.Raw.PPID)),
+		)
+		if len(ev.MitreTags) > 0 {
+			rec.AddAttributes(log.String("mitre.technique.ids", strings.Join(ev.MitreTags, ",")))
+		}
+		c.logger.Emit(ctx, rec)
 	}
-	if len(ev.MitreTags) > 0 {
-		attrs = append(attrs, attribute.String("mitre.technique.ids", strings.Join(ev.MitreTags, ",")))
+
+	if c.tracer != nil {
+		attrs := []attribute.KeyValue{
+			attribute.Int("ebpf.event.type_id", int(ev.Raw.EventType)),
+			attribute.String("ebpf.event.comm", ev.Raw.CommString()),
+			attribute.String("ebpf.event.binary", ev.Binary),
+			attribute.String("ebpf.event.dest_ip", ev.Raw.FormatDestIP()),
+			attribute.Int("ebpf.event.dest_port", int(ev.Raw.DestPort)),
+			attribute.Int("ebpf.event.ppid", int(ev.Raw.PPID)),
+		}
+		if len(ev.MitreTags) > 0 {
+			attrs = append(attrs, attribute.String("mitre.technique.ids", strings.Join(ev.MitreTags, ",")))
+		}
+		_, span := c.tracer.Start(ctx, "security.event", trace.WithAttributes(attrs...))
+		span.End()
 	}
-	_, span := c.tracer.Start(ctx, "security.event", trace.WithAttributes(attrs...))
+}
+
+// EmitChainSpan emits a parent/child kill-chain span.
+func (c *Client) EmitChainSpan(ctx context.Context, parent trace.SpanContext, name string, attrs []attribute.KeyValue) {
+	if c == nil || c.tracer == nil {
+		return
+	}
+	opts := []trace.SpanStartOption{trace.WithAttributes(attrs...)}
+	if parent.IsValid() {
+		opts = append(opts, trace.WithLinks(trace.Link{SpanContext: parent}))
+	}
+	_, span := c.tracer.Start(ctx, name, opts...)
 	span.End()
 }
 

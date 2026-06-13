@@ -159,6 +159,7 @@ func main() {
 	)
 
 	blEngine := baseline.NewEngine(cfg.Baseline.EWMAAlpha, cfg.Scoring.MinimumSamples)
+	blEngine.SetFastTrackWindow(cfg.Baseline.NewDimensionLearnWindow)
 
 	var st *store.Store
 	st, err = store.New(cfg.Baseline.StateFile)
@@ -176,6 +177,11 @@ func main() {
 	otelClient, err := otelexport.Init(context.Background(), cfg.OTel, hostID, cfg.Host.Labels)
 	if err != nil {
 		log.Fatalf("otel init: %v", err)
+	}
+
+	var chainDetector *mitre.ChainDetector
+	if otelClient != nil {
+		chainDetector = mitre.NewChainDetector(otelClient)
 	}
 
 	var scoreMu sync.Mutex
@@ -263,6 +269,10 @@ func main() {
 						otelClient.EmitSecurityEvent(context.Background(), enriched)
 					}
 				}
+			}
+
+			if chainDetector != nil {
+				chainDetector.Observe(context.Background(), enriched)
 			}
 
 			agg.Add(enriched)

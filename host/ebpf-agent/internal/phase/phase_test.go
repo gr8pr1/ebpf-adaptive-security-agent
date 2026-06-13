@@ -21,7 +21,7 @@ func TestProcessWindowColdStartBeforeIngest(t *testing.T) {
 			}
 		}
 	})
-	mgr.phase = PhaseMonitoring
+	mgr.SetPhaseForTest(PhaseMonitoring)
 
 	w := &aggregator.Window{
 		Start: time.Date(2026, 6, 10, 14, 0, 0, 0, time.UTC),
@@ -37,8 +37,8 @@ func TestProcessWindowColdStartBeforeIngest(t *testing.T) {
 		t.Fatal("expected cold-start anomaly for unseen dimension")
 	}
 
-	if eng.TotalSamples(aggregator.DimensionKey{MetricName: "connect", User: "alice"}) != 0 {
-		t.Fatal("cold-start dimension should not be ingested when flagged anomalous")
+	if eng.TotalSamples(aggregator.DimensionKey{MetricName: "connect", User: "alice"}) == 0 {
+		t.Fatal("cold-start dimension should be ingested during fast-track learning")
 	}
 }
 
@@ -47,7 +47,7 @@ func TestProcessWindowIngestsNonAnomalousOnly(t *testing.T) {
 	sc := scorer.New(eng, 3.0, 1.0, "warning", map[string]float64{"ptrace": 5}, false)
 
 	mgr := NewManager(eng, sc, nil, time.Hour, time.Hour, nil)
-	mgr.phase = PhaseMonitoring
+	mgr.SetPhaseForTest(PhaseMonitoring)
 
 	// Seed baseline for exec so it is known and below ceiling.
 	seed := &aggregator.Window{

@@ -1,6 +1,7 @@
 package aggregator
 
 import (
+	"fmt"
 	"path/filepath"
 	"sync"
 	"time"
@@ -8,6 +9,8 @@ import (
 	"ebpf-agent/internal/enricher"
 	"ebpf-agent/internal/ringbuf"
 )
+
+const shortLivedThresholdNs = 5 * uint64(time.Second)
 
 // DimensionKey uniquely identifies a metric dimension for baselining.
 type DimensionKey struct {
@@ -19,9 +22,9 @@ type DimensionKey struct {
 
 // Window holds aggregated counts for a single time window.
 type Window struct {
-	Start    time.Time
-	End      time.Time
-	Counts   map[DimensionKey]float64
+	Start  time.Time
+	End    time.Time
+	Counts map[DimensionKey]float64
 }
 
 // Aggregator collects enriched events into time-bucketed windows.
@@ -33,7 +36,10 @@ type Aggregator struct {
 	network      bool
 	filesystem   bool
 	scheduling   bool
-	uniqueDestIP map[DimensionKey]map[string]struct{} // connect events only: dedupe dest IPs per dimension key
+	uniqueDestIP map[DimensionKey]map[string]struct{}
+
+	pidExecNs map[uint32]uint64
+	ppidForks map[uint32]float64
 
 	mu      sync.Mutex
 	current *Window
@@ -50,6 +56,8 @@ func New(windowSize time.Duration, perUser, perProcess, perContainer, network, f
 		filesystem:   filesystem,
 		scheduling:   scheduling,
 		uniqueDestIP: make(map[DimensionKey]map[string]struct{}),
+		pidExecNs:    make(map[uint32]uint64),
+		ppidForks:    make(map[uint32]float64),
 		current: &Window{
 			Start:  now,
 			End:    now.Add(windowSize),
@@ -65,28 +73,22 @@ func (a *Aggregator) shouldInclude(ev *enricher.EnrichedEvent) bool {
 			return false
 		}
 	}
-	if !a.filesystem && ev.Raw.EventType == ringbuf.EventOpenat {
-		return false
+	if !a.filesystem {
+		switch ev.Raw.EventType {
+		case ringbuf.EventOpenat, ringbuf.EventWrite:
+			return false
+		}
 	}
 	if !a.scheduling {
 		switch ev.Raw.EventType {
-		case ringbuf.EventFork, ringbuf.EventExit:
+		case ringbuf.EventFork, ringbuf.EventExit, ringbuf.EventOOMKill:
 			return false
 		}
 	}
 	return true
 }
 
-func (a *Aggregator) Add(ev *enricher.EnrichedEvent) {
-	if !a.shouldInclude(ev) {
-		return
-	}
-
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	metricName := eventTypeToMetric(ev.Raw.EventType, ev.Raw.Flags)
-
+func (a *Aggregator) dimensionKey(metricName string, ev *enricher.EnrichedEvent) DimensionKey {
 	key := DimensionKey{MetricName: metricName}
 	if a.perUser {
 		key.User = ev.Username
@@ -101,20 +103,60 @@ func (a *Aggregator) Add(ev *enricher.EnrichedEvent) {
 	if a.perCont && ev.Container != "" {
 		key.Container = ev.Container
 	}
+	return key
+}
 
+func (a *Aggregator) increment(metricName string, ev *enricher.EnrichedEvent) {
+	key := a.dimensionKey(metricName, ev)
 	a.current.Counts[key]++
 
 	hostKey := DimensionKey{MetricName: metricName}
 	if key != hostKey {
 		a.current.Counts[hostKey]++
 	}
+}
 
-	// unique_dest_ips: distinct destination IPs per dimension (connect only, not suspicious_connect)
+func (a *Aggregator) Add(ev *enricher.EnrichedEvent) {
+	if !a.shouldInclude(ev) {
+		return
+	}
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	metricName := eventTypeToMetric(ev.Raw.EventType, ev.Raw.Flags)
+	a.increment(metricName, ev)
+
+	switch ev.Raw.EventType {
+	case ringbuf.EventExec:
+		a.pidExecNs[ev.Raw.PID] = ev.Raw.TimestampNs
+	case ringbuf.EventFork:
+		if ev.Raw.PPID > 0 {
+			a.ppidForks[ev.Raw.PPID]++
+			if a.ppidForks[ev.Raw.PPID] >= 50 {
+				dk := DimensionKey{MetricName: "fork_bomb_score"}
+				if a.perProcess {
+					dk.Process = fmt.Sprintf("ppid:%d", ev.Raw.PPID)
+				}
+				a.current.Counts[dk] = a.ppidForks[ev.Raw.PPID]
+			}
+		}
+	case ringbuf.EventExit:
+		if start, ok := a.pidExecNs[ev.Raw.PID]; ok {
+			if ev.Raw.TimestampNs > start && ev.Raw.TimestampNs-start < shortLivedThresholdNs {
+				a.increment("short_lived_process", ev)
+			}
+			delete(a.pidExecNs, ev.Raw.PID)
+		}
+	}
+
 	if metricName == "connect" && ev.Raw.IPVersion != ringbuf.IPVersionNone {
 		ipStr := ev.Raw.FormatDestIP()
 		if ipStr != "" {
+			key := a.dimensionKey("connect", ev)
 			a.recordUniqueIPForConnect(key, ipStr)
-			if hostKey != key {
+			hostKey := DimensionKey{MetricName: "connect"}
+			if key != hostKey {
 				a.recordUniqueIPForConnect(hostKey, ipStr)
 			}
 		}
@@ -144,6 +186,7 @@ func (a *Aggregator) Rotate() *Window {
 	finished := a.current
 	now := time.Now()
 	a.uniqueDestIP = make(map[DimensionKey]map[string]struct{})
+	a.ppidForks = make(map[uint32]float64)
 	a.current = &Window{
 		Start:  now,
 		End:    now.Add(a.windowSize),
@@ -176,7 +219,14 @@ func eventTypeToMetric(evType uint8, flags uint8) string {
 		if flags&ringbuf.FlagSensitiveFile != 0 {
 			return "sensitive_file"
 		}
+		if flags&ringbuf.FlagTmpFile != 0 {
+			return "tmp_file_creation_rate"
+		}
 		return "file_open"
+	case ringbuf.EventWrite:
+		return "file_write_rate"
+	case ringbuf.EventOOMKill:
+		return "oom_kill"
 	case ringbuf.EventSetuid:
 		return "setuid"
 	case ringbuf.EventSetgid:

@@ -4,12 +4,16 @@ import (
 	"math"
 	"sort"
 	"sync"
+	"time"
 
 	"ebpf-agent/internal/aggregator"
 )
 
 // HourlyBuckets is the number of seasonal buckets: 24 hours * 7 days.
 const HourlyBuckets = 168
+
+// ObsRingSize is the rolling observation window for robust median/MAD/skewness.
+const ObsRingSize = 32
 
 // BucketStats holds running statistics for a single seasonal bucket.
 type BucketStats struct {
@@ -21,8 +25,7 @@ type BucketStats struct {
 	EWMA     float64
 	EWMAVar  float64
 	EWMAInit bool
-	// Last up to 8 observations for robust median/MAD (rolling).
-	ObsRing  [8]float64
+	ObsRing  [ObsRingSize]float64
 	ObsCount int
 }
 
@@ -52,14 +55,14 @@ func (b *BucketStats) EWMAStdDev() float64 {
 	return math.Sqrt(b.EWMAVar)
 }
 
-func pushObsRing(ring *[8]float64, count *int, v float64) {
-	if *count < 8 {
+func pushObsRing(ring *[ObsRingSize]float64, count *int, v float64) {
+	if *count < ObsRingSize {
 		ring[*count] = v
 		(*count)++
 		return
 	}
 	copy(ring[:], ring[1:])
-	ring[7] = v
+	ring[ObsRingSize-1] = v
 }
 
 func (b *BucketStats) medianObs() float64 {
@@ -67,9 +70,9 @@ func (b *BucketStats) medianObs() float64 {
 	if n == 0 {
 		return 0
 	}
-	var tmp [8]float64
-	copy(tmp[:], b.ObsRing[:n])
-	sort.Float64s(tmp[:n])
+	tmp := make([]float64, n)
+	copy(tmp, b.ObsRing[:n])
+	sort.Float64s(tmp)
 	if n%2 == 1 {
 		return tmp[n/2]
 	}
@@ -83,15 +86,39 @@ func (b *BucketStats) madObs() float64 {
 		return 0
 	}
 	med := b.medianObs()
-	var dev [8]float64
+	dev := make([]float64, n)
 	for i := 0; i < n; i++ {
 		dev[i] = math.Abs(b.ObsRing[i] - med)
 	}
-	sort.Float64s(dev[:n])
+	sort.Float64s(dev)
 	if n%2 == 1 {
 		return dev[n/2]
 	}
 	return (dev[n/2-1] + dev[n/2]) / 2
+}
+
+// Skewness estimates sample skewness from the observation ring (needs >= 8 samples).
+func (b *BucketStats) Skewness() float64 {
+	n := b.ObsCount
+	if n < 8 {
+		return 0
+	}
+	var sum, sum2, sum3 float64
+	for i := 0; i < n; i++ {
+		v := b.ObsRing[i]
+		sum += v
+		sum2 += v * v
+		sum3 += v * v * v
+	}
+	fn := float64(n)
+	mean := sum / fn
+	variance := sum2/fn - mean*mean
+	if variance <= 1e-12 {
+		return 0
+	}
+	stddev := math.Sqrt(variance)
+	m3 := sum3/fn - 3*mean*variance - mean*mean*mean
+	return m3 / (stddev * stddev * stddev)
 }
 
 // DimensionBaseline holds 168 hourly buckets for one metric dimension.
@@ -101,18 +128,57 @@ type DimensionBaseline struct {
 
 // Engine manages baselines for all dimensions.
 type Engine struct {
-	alpha     float64
-	minSample int
-	mu        sync.RWMutex
-	baselines map[aggregator.DimensionKey]*DimensionBaseline
+	alpha            float64
+	minSample        int
+	fastTrackWindow  time.Duration
+	mu               sync.RWMutex
+	baselines        map[aggregator.DimensionKey]*DimensionBaseline
+	fastTrackStarted map[aggregator.DimensionKey]time.Time
 }
 
 func NewEngine(ewmaAlpha float64, minSamples int) *Engine {
 	return &Engine{
-		alpha:     ewmaAlpha,
-		minSample: minSamples,
-		baselines: make(map[aggregator.DimensionKey]*DimensionBaseline),
+		alpha:            ewmaAlpha,
+		minSample:        minSamples,
+		fastTrackWindow:  24 * time.Hour,
+		baselines:        make(map[aggregator.DimensionKey]*DimensionBaseline),
+		fastTrackStarted: make(map[aggregator.DimensionKey]time.Time),
 	}
+}
+
+func (e *Engine) SetFastTrackWindow(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	e.mu.Lock()
+	e.fastTrackWindow = d
+	e.mu.Unlock()
+}
+
+func (e *Engine) StartFastTrack(key aggregator.DimensionKey, at time.Time) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if _, exists := e.fastTrackStarted[key]; exists {
+		return
+	}
+	e.fastTrackStarted[key] = at
+}
+
+func (e *Engine) InFastTrack(key aggregator.DimensionKey, at time.Time) bool {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	start, ok := e.fastTrackStarted[key]
+	if !ok {
+		return false
+	}
+	if at.Sub(start) > e.fastTrackWindow {
+		return false
+	}
+	return true
+}
+
+func (e *Engine) ShouldIngestColdStart(key aggregator.DimensionKey, at time.Time) bool {
+	return e.InFastTrack(key, at)
 }
 
 // SeasonalIndex computes the 0–167 bucket from wall clock time.
@@ -281,7 +347,21 @@ func (e *Engine) LookupRobust(key aggregator.DimensionKey, hour, dow int) (mean,
 	return res.Mean, res.StdDev, res.EWMA, median, mad, res.Ready
 }
 
-// AllDimensions returns all tracked dimension keys.
+// LookupSkewness returns sample skewness for the seasonal bucket observation ring.
+func (e *Engine) LookupSkewness(key aggregator.DimensionKey, hour, dow int) float64 {
+	idx := SeasonalIndex(hour, dow)
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	bl, ok := e.baselines[key]
+	if !ok {
+		return 0
+	}
+	b := e.bucketAt(bl, idx)
+	if b == nil {
+		return 0
+	}
+	return b.Skewness()
+}
 func (e *Engine) AllDimensions() []aggregator.DimensionKey {
 	e.mu.RLock()
 	defer e.mu.RUnlock()

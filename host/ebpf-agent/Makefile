@@ -14,6 +14,10 @@ MONITOR_EXIT    ?= 1
 MONITOR_BIND    ?= 1
 MONITOR_DNS     ?= 1
 MONITOR_CAPSET  ?= 1
+MONITOR_WRITE   ?= 1
+MONITOR_OPEN    ?= 1
+MONITOR_OPENAT2 ?= 1
+MONITOR_OOM     ?= 1
 
 BPF_FLAGS :=
 ifeq ($(MONITOR_EXEC),1)
@@ -51,6 +55,18 @@ ifeq ($(MONITOR_DNS),1)
 endif
 ifeq ($(MONITOR_CAPSET),1)
   BPF_FLAGS += -DMONITOR_CAPSET
+endif
+ifeq ($(MONITOR_WRITE),1)
+  BPF_FLAGS += -DMONITOR_WRITE
+endif
+ifeq ($(MONITOR_OPEN),1)
+  BPF_FLAGS += -DMONITOR_OPEN
+endif
+ifeq ($(MONITOR_OPENAT2),1)
+  BPF_FLAGS += -DMONITOR_OPENAT2
+endif
+ifeq ($(MONITOR_OOM),1)
+  BPF_FLAGS += -DMONITOR_OOM
 endif
 
 all: bpf build

@@ -11,7 +11,8 @@ import (
 	cringbuf "github.com/cilium/ebpf/ringbuf"
 )
 
-const EventSize = 64
+// EventHeaderSize is the fixed BPF/userspace event header (72 bytes).
+const EventHeaderSize = 72
 
 const (
 	EventExec    uint8 = 1
@@ -25,6 +26,8 @@ const (
 	EventBind    uint8 = 9
 	EventDNS     uint8 = 10
 	EventCapset  uint8 = 11
+	EventWrite   uint8 = 12
+	EventOOMKill uint8 = 13
 )
 
 const (
@@ -38,20 +41,24 @@ const (
 	FlagSuspiciousPort uint8 = 1 << 1
 	FlagSensitiveFile  uint8 = 1 << 2
 	FlagPasswdRead     uint8 = 1 << 3
+	FlagTmpFile        uint8 = 1 << 4
 )
 
 type Event struct {
 	TimestampNs uint64
 	PID         uint32
+	PPID        uint32
 	UID         uint32
-	CgroupID    uint64
 	EventType   uint8
 	Flags       uint8
 	DestPort    uint16
 	IPVersion   uint8
-	_           [3]byte
+	PathLen     uint8
+	_           uint16
+	CgroupID    uint64
 	DestIP      [16]byte
 	Comm        [16]byte
+	Filename    string // exec events: variable-length tail after header
 }
 
 // DestIPv4U32 returns the first four bytes of DestIP as a uint32 (matches prior BPF sin_addr layout).
@@ -81,23 +88,38 @@ func (e *Event) FormatDestIP() string {
 	}
 }
 
-func parseEvent(data []byte) (*Event, error) {
-	if len(data) < EventSize {
+// ParseEvent decodes a ringbuf record (fixed header + optional filename tail).
+func ParseEvent(data []byte) (*Event, error) {
+	if len(data) < EventHeaderSize {
 		return nil, errors.New("record too short")
 	}
 	e := &Event{
 		TimestampNs: binary.LittleEndian.Uint64(data[0:8]),
 		PID:         binary.LittleEndian.Uint32(data[8:12]),
-		UID:         binary.LittleEndian.Uint32(data[12:16]),
-		CgroupID:    binary.LittleEndian.Uint64(data[16:24]),
-		EventType:   data[24],
-		Flags:       data[25],
-		DestPort:    binary.LittleEndian.Uint16(data[26:28]),
-		IPVersion:   data[28],
+		PPID:        binary.LittleEndian.Uint32(data[12:16]),
+		UID:         binary.LittleEndian.Uint32(data[16:20]),
+		EventType:   data[20],
+		Flags:       data[21],
+		DestPort:    binary.LittleEndian.Uint16(data[22:24]),
+		IPVersion:   data[24],
+		PathLen:     data[25],
+		CgroupID:    binary.LittleEndian.Uint64(data[28:36]),
 	}
-	copy(e.DestIP[:], data[32:48])
-	copy(e.Comm[:], data[48:64])
+	copy(e.DestIP[:], data[36:52])
+	copy(e.Comm[:], data[52:68])
+
+	if e.PathLen > 0 {
+		end := EventHeaderSize + int(e.PathLen)
+		if len(data) < end {
+			return nil, fmt.Errorf("record tail too short: need %d bytes, got %d", end, len(data))
+		}
+		e.Filename = string(data[EventHeaderSize:end])
+	}
 	return e, nil
+}
+
+func parseEvent(data []byte) (*Event, error) {
+	return ParseEvent(data)
 }
 
 type Consumer struct {

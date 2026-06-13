@@ -99,6 +99,13 @@ func (m *Manager) Phase() int {
 	return m.phase
 }
 
+// SetPhaseForTest forces the lifecycle phase (integration tests only).
+func (m *Manager) SetPhaseForTest(p int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.phase = p
+}
+
 func (m *Manager) Progress() float64 {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -144,6 +151,9 @@ func (m *Manager) ProcessWindow(w *aggregator.Window) {
 	skip := make(map[aggregator.DimensionKey]struct{})
 	for _, r := range results {
 		if r.Anomaly {
+			if r.ColdStart && m.engine.ShouldIngestColdStart(r.Key, w.Start) {
+				continue
+			}
 			skip[r.Key] = struct{}{}
 		}
 	}

@@ -138,7 +138,7 @@ Disable detection modules at compile time:
 make bpf MONITOR_CONNECT=0 MONITOR_PTRACE=0 MONITOR_DNS=0
 ```
 
-Available flags: `MONITOR_EXEC`, `MONITOR_SUDO`, `MONITOR_PASSWD`, `MONITOR_CONNECT`, `MONITOR_PTRACE`, `MONITOR_OPENAT`, `MONITOR_SETUID`, `MONITOR_FORK`, `MONITOR_EXIT`, `MONITOR_BIND`, `MONITOR_DNS`, `MONITOR_CAPSET`.
+Available flags: `MONITOR_EXEC`, `MONITOR_SUDO`, `MONITOR_PASSWD`, `MONITOR_CONNECT`, `MONITOR_PTRACE`, `MONITOR_OPENAT`, `MONITOR_OPEN`, `MONITOR_OPENAT2`, `MONITOR_WRITE`, `MONITOR_SETUID`, `MONITOR_FORK`, `MONITOR_EXIT`, `MONITOR_BIND`, `MONITOR_DNS`, `MONITOR_CAPSET`, `MONITOR_OOM`.
 
 ## Health Metrics
 
@@ -256,7 +256,6 @@ The agent does **not** export per-event counters or anomaly gauges to Prometheus
 
 - **Packet payload inspection** — sees destination port/IP but not data content
 - **Fileless malware** — `memfd_create` + `execveat` bypasses the `execve` tracepoint
-- **Legacy/alternate file syscalls** — only `openat` is traced; `open(2)` and `openat2(2)` bypass file monitoring
 - **Path matching** — BPF uses a 64-byte path buffer; long paths, relative paths, and symlinks can evade exact string matches
 - **Failed syscalls** — `sys_enter_*` tracepoints fire before the kernel returns; EPERM/refused operations look the same as successes
 - **Cross-host correlation** — each agent is independent (planned: OTel-based fleet correlation)
@@ -270,8 +269,22 @@ The agent does **not** export per-event counters or anomaly gauges to Prometheus
 - Baseline state file (`/var/lib/ebpf-agent/baseline.db`) must be root-owned (0600) to prevent baseline poisoning
 - EWMA drift adaptation means an attacker slowly escalating over weeks could shift the baseline — mitigated by anomalous-window ingest gating and absolute ceiling thresholds (`scoring.ceilings`)
 - During the learning phase, high-value security events (ptrace, capset, suspicious connections) are still logged
-- Enricher PID resolution can fail for short-lived processes (TOCTOU) — failures are explicitly logged with `ENRICH-FAIL`
+- Exec events carry the filename in-kernel (no `/proc` round-trip); other events may still hit enricher TOCTOU for short-lived processes — logged as `ENRICH-FAIL`
 - Enable TLS and basic auth on the health endpoint in production
+
+## Changelog (2026-06-13)
+
+Refined Next Implementations (ARCHITECTURE P1–P7):
+
+| Area | Change |
+|---|---|
+| **P1 Tests** | Integration replay harness; BPF header layout parity tests |
+| **P2 Struct** | 72B header + `ppid` + variable-length exec filename; schema v2 snapshots |
+| **P2 Fast-track** | `new_dimension_learn_window` wired — cold-start dimensions learn over 24h |
+| **P3 Coverage** | `open`/`openat2`/`write`/`oom` tracepoints; fork-bomb, short-lived, tmp/write metrics |
+| **P5 OTel** | Security events as LogRecords; batch config wired; hardened collector example |
+| **P6 Kill-chain** | Open-source temporal MITRE correlation via `ppid` + OTel spans |
+| **P7 Scorer** | 32-sample observation ring; auto MAD when \|skewness\| > 1 |
 
 ## Changelog (2026-06-12)
 
