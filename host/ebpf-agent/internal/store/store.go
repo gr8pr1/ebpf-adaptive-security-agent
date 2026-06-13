@@ -67,6 +67,16 @@ func New(path string) (*Store, error) {
 		return nil, fmt.Errorf("creating metadata table: %w", err)
 	}
 
+	if _, err := db.Exec(`
+		CREATE TABLE IF NOT EXISTS novelty_seen (
+			key TEXT PRIMARY KEY,
+			first_seen DATETIME DEFAULT CURRENT_TIMESTAMP
+		)
+	`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("creating novelty_seen table: %w", err)
+	}
+
 	if err := os.Chmod(path, 0600); err != nil && !os.IsNotExist(err) {
 		_ = err
 	}
@@ -155,4 +165,17 @@ func (s *Store) GetMeta(key string) (string, error) {
 
 func (s *Store) Close() error {
 	return s.db.Close()
+}
+
+// HasNovelty reports whether a novelty key was previously recorded.
+func (s *Store) HasNovelty(key string) bool {
+	var n int
+	err := s.db.QueryRow("SELECT 1 FROM novelty_seen WHERE key = ? LIMIT 1", key).Scan(&n)
+	return err == nil
+}
+
+// RecordNovelty persists a first-seen novelty key.
+func (s *Store) RecordNovelty(key string) error {
+	_, err := s.db.Exec("INSERT OR IGNORE INTO novelty_seen (key) VALUES (?)", key)
+	return err
 }

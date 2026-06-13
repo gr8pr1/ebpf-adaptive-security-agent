@@ -27,7 +27,7 @@ func TestEWMAUpdatesOnIngest(t *testing.T) {
 	}
 	eng.Ingest(w2)
 
-	mean, _, ewma, ready := eng.Lookup(aggregator.DimensionKey{MetricName: "exec"}, 14, int(time.Tuesday))
+	mean, _, ewma, _, _, ready := eng.Lookup(aggregator.DimensionKey{MetricName: "exec"}, 14, int(time.Tuesday))
 	if !ready {
 		t.Fatal("expected bucket ready")
 	}
@@ -76,7 +76,7 @@ func TestNeighborBucketFallback(t *testing.T) {
 	eng.Ingest(w13)
 	eng.Ingest(w13)
 
-	mean, _, _, ready := eng.Lookup(key, 14, int(time.Tuesday))
+	mean, _, _, _, _, ready := eng.Lookup(key, 14, int(time.Tuesday))
 	if !ready {
 		t.Fatal("expected neighbor fallback to make bucket ready")
 	}
@@ -100,7 +100,7 @@ func TestRestoreBackfillsEWMAFromLegacySnapshot(t *testing.T) {
 	eng2 := NewEngine(0.01, 2)
 	eng2.Restore(snaps)
 
-	mean, _, ewma, ready := eng2.Lookup(key, 14, int(time.Tuesday))
+	mean, _, ewma, _, _, ready := eng2.Lookup(key, 14, int(time.Tuesday))
 	if !ready {
 		t.Fatal("expected legacy snapshot to be ready after EWMA backfill")
 	}
@@ -124,7 +124,7 @@ func TestEWMAInitPersistsInJSON(t *testing.T) {
 	eng2 := NewEngine(0.01, 1)
 	eng2.Restore(snaps)
 
-	_, _, ewma, ready := eng2.Lookup(aggregator.DimensionKey{MetricName: "exec"}, 14, int(time.Tuesday))
+	_, _, ewma, _, _, ready := eng2.Lookup(aggregator.DimensionKey{MetricName: "exec"}, 14, int(time.Tuesday))
 	if !ready || ewma != 3 {
 		t.Fatalf("expected restored EWMA 3, got ewma=%f ready=%v", ewma, ready)
 	}

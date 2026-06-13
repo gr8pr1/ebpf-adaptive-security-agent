@@ -22,12 +22,16 @@ import (
 
 	"ebpf-agent/internal/aggregator"
 	"ebpf-agent/internal/baseline"
+	"ebpf-agent/internal/composite"
 	"ebpf-agent/internal/config"
 	"ebpf-agent/internal/enricher"
 	"ebpf-agent/internal/mitre"
+	"ebpf-agent/internal/novelty"
 	"ebpf-agent/internal/otelexport"
 	"ebpf-agent/internal/phase"
+	"ebpf-agent/internal/proctable"
 	"ebpf-agent/internal/ringbuf"
+	"ebpf-agent/internal/rules"
 	"ebpf-agent/internal/scorer"
 	"ebpf-agent/internal/store"
 	"ebpf-agent/internal/version"
@@ -160,6 +164,8 @@ func main() {
 
 	blEngine := baseline.NewEngine(cfg.Baseline.EWMAAlpha, cfg.Scoring.MinimumSamples)
 	blEngine.SetFastTrackWindow(cfg.Baseline.NewDimensionLearnWindow)
+	blEngine.SetFastTrendAlpha(cfg.Baseline.FastTrendAlpha)
+	blEngine.SetHoldHighSeverityFastTrack(cfg.Baseline.FastTrackHoldHighSeverity)
 
 	var st *store.Store
 	st, err = store.New(cfg.Baseline.StateFile)
@@ -172,17 +178,21 @@ func main() {
 	}
 
 	sc := scorer.New(blEngine, cfg.Scoring.ZScoreThreshold, cfg.Baseline.MinStdDev, cfg.Scoring.ColdStartSeverity,
-		cfg.Scoring.Ceilings, cfg.Scoring.MADEnabled)
+		cfg.Scoring.Ceilings, cfg.Scoring.MADEnabled, cfg.Scoring.CeilingMultiplier, cfg.Scoring.MaintenanceWindows)
 
 	otelClient, err := otelexport.Init(context.Background(), cfg.OTel, hostID, cfg.Host.Labels)
 	if err != nil {
 		log.Fatalf("otel init: %v", err)
 	}
 
+	procTable := proctable.New()
 	var chainDetector *mitre.ChainDetector
 	if otelClient != nil {
-		chainDetector = mitre.NewChainDetector(otelClient)
+		chainDetector = mitre.NewChainDetector(otelClient, procTable, cfg.Detection.SupervisorRoots)
 	}
+
+	ruleEngine := rules.New(cfg.Detection.EventRules)
+	compositeEngine := composite.New(cfg.Detection.CompositeRules)
 
 	var scoreMu sync.Mutex
 	onScore := func(results []scorer.Result, win *aggregator.Window) {
@@ -192,15 +202,15 @@ func main() {
 			if r.Anomaly {
 				dim := dimensionLabel(r.Key)
 				if r.ColdStart {
-					log.Printf("COLD-START [%s] %s/%s new dimension observed (count=%.0f)",
-						r.Severity, r.Key.MetricName, dim, r.Observed)
+					log.Printf("COLD-START [%s] %s/%s new dimension observed (count=%.0f conf=%.2f)",
+						r.Severity, r.Key.MetricName, dim, r.Observed, r.Confidence)
 				} else {
 					extra := ""
 					if r.UsedMAD {
 						extra = " (MAD)"
 					}
-					log.Printf("ANOMALY [%s] %s/%s z=%.2f (mean=%.2f stddev=%.2f observed=%.0f)%s",
-						r.Severity, r.Key.MetricName, dim, r.ZScore, r.Mean, r.StdDev, r.Observed, extra)
+					log.Printf("ANOMALY [%s] %s/%s z=%.2f (mean=%.2f stddev=%.2f observed=%.0f conf=%.2f)%s",
+						r.Severity, r.Key.MetricName, dim, r.ZScore, r.Mean, r.StdDev, r.Observed, r.Confidence, extra)
 				}
 				if otelClient != nil && win != nil {
 					otelClient.EmitAnomaly(context.Background(), r, win)
@@ -216,7 +226,9 @@ func main() {
 		onScore,
 	)
 
-	enrich := enricher.New(cfg.Container.CgroupRoot)
+	noveltyTracker := novelty.New(st, phaseMgr.Phase)
+
+	enrich := enricher.New(cfg.Container.CgroupRoot, cfg.Detection.SensitivePaths)
 	agg := aggregator.New(
 		cfg.Baseline.AggregationWindow,
 		cfg.Dimensions.PerUser,
@@ -225,6 +237,8 @@ func main() {
 		cfg.Dimensions.Network,
 		cfg.Dimensions.FileSystem,
 		cfg.Dimensions.Scheduling,
+		cfg.Dimensions.NormalizeBinaryVersion,
+		cfg.Dimensions.PreferImageName,
 	)
 
 	eventsMap, hasRingbuf := coll.Maps["events"]
@@ -260,15 +274,27 @@ func main() {
 					ev.PID, ev.CommString())
 			}
 
-			if otelClient != nil {
-				switch enriched.Raw.EventType {
-				case ringbuf.EventPtrace, ringbuf.EventCapset:
-					otelClient.EmitSecurityEvent(context.Background(), enriched)
-				default:
-					if enriched.Raw.Flags&(ringbuf.FlagSuspiciousPort|ringbuf.FlagSensitiveFile|ringbuf.FlagPasswdRead) != 0 {
-						otelClient.EmitSecurityEvent(context.Background(), enriched)
-					}
+			procTable.Observe(enriched)
+
+			for _, m := range ruleEngine.Evaluate(enriched) {
+				rules.EmitLogs([]rules.Match{m})
+				if otelClient != nil {
+					otelClient.EmitSecurityEvent(context.Background(), m.Event)
 				}
+				if isHighSeverityRule(m.RuleName) {
+					blEngine.MarkHighSeverityMetric(m.RuleName)
+				}
+			}
+
+			for _, s := range noveltyTracker.Observe(enriched) {
+				novelty.EmitLogs([]novelty.Signal{s})
+				if otelClient != nil {
+					otelClient.EmitSecurityEvent(context.Background(), s.Event)
+				}
+			}
+
+			for _, m := range compositeEngine.Observe(enriched) {
+				composite.EmitLogs([]composite.Match{m}, enriched.Raw.PID)
 			}
 
 			if chainDetector != nil {
@@ -318,12 +344,16 @@ func main() {
 	healthTicker := time.NewTicker(5 * time.Second)
 	defer healthTicker.Stop()
 
+	procPruneTicker := time.NewTicker(time.Minute)
+	defer procPruneTicker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
 			log.Println("Shutting down...")
 			windowTicker.Stop()
 			healthTicker.Stop()
+			procPruneTicker.Stop()
 			_ = rbConsumer.Close()
 			consumerWg.Wait()
 			w := agg.Rotate()
@@ -351,10 +381,22 @@ func main() {
 				ringbufBPFDrops.Store(readBPFRingbufDrops(ringbufDropsMap))
 			}
 
+		case <-procPruneTicker.C:
+			procTable.Prune(10 * time.Minute)
+
 		case <-windowTicker.C:
 			w := agg.Rotate()
 			phaseMgr.ProcessWindow(w)
 		}
+	}
+}
+
+func isHighSeverityRule(name string) bool {
+	switch name {
+	case "ptrace", "suspicious_connect", "sensitive_file", "sudo":
+		return true
+	default:
+		return false
 	}
 }
 

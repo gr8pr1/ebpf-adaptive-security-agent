@@ -75,7 +75,11 @@ func (e *Event) CommString() string {
 	return string(e.Comm[:])
 }
 
-// FormatDestIP returns a display string for the destination address (IPv4 or IPv6).
+// OpenPath returns the path tail for exec/open events.
+func (e *Event) OpenPath() string {
+	return e.Filename
+}
+
 func (e *Event) FormatDestIP() string {
 	switch e.IPVersion {
 	case IPVersion4:

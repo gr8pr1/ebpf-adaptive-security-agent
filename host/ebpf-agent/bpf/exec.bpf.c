@@ -251,7 +251,7 @@ static __always_inline void emit_event(__u8 event_type, __u8 flags,
     bpf_ringbuf_submit(e, 0);
 }
 
-static __always_inline void emit_exec_event(__u8 flags, const char *filename, __u32 path_len)
+static __always_inline void emit_path_event(__u8 event_type, __u8 flags, const char *path, __u32 path_len)
 {
     if (path_len > MAX_EXEC_PATH)
         path_len = MAX_EXEC_PATH;
@@ -260,19 +260,24 @@ static __always_inline void emit_exec_event(__u8 flags, const char *filename, __
     char buf[EVENT_HEADER_SIZE + MAX_EXEC_PATH] = {};
 
     struct ebpf_event *e = (struct ebpf_event *)buf;
-    fill_event_header(e, EVENT_EXEC, flags, 0, 0, (__u8)path_len, 0, NULL);
-    if (path_len > 0 && filename) {
+    fill_event_header(e, event_type, flags, 0, 0, (__u8)path_len, 0, NULL);
+    if (path_len > 0 && path) {
         #pragma unroll
         for (__u32 i = 0; i < MAX_EXEC_PATH; i++) {
             if (i >= path_len)
                 break;
-            buf[EVENT_HEADER_SIZE + i] = filename[i];
+            buf[EVENT_HEADER_SIZE + i] = path[i];
         }
     }
 
     long ret = bpf_ringbuf_output(&events, buf, total, 0);
     if (ret < 0)
         inc_ringbuf_drop();
+}
+
+static __always_inline void emit_exec_event(__u8 flags, const char *filename, __u32 path_len)
+{
+    emit_path_event(EVENT_EXEC, flags, filename, path_len);
 }
 
 /* ============================================================
@@ -322,7 +327,6 @@ SEC("tracepoint/syscalls/sys_enter_execve")
 int trace_exec(struct trace_event_raw_sys_enter *ctx)
 {
     char filename[128] = {0};
-    char arg_buf[16] = {0};
     __u8 flags = 0;
 
     long ret = bpf_probe_read_user_str(filename, sizeof(filename) - 1, (void *)ctx->args[0]);
@@ -341,35 +345,7 @@ int trace_exec(struct trace_event_raw_sys_enter *ctx)
         flags |= FLAG_SUDO;
 
     int is_cat = ends_with(filename, ret, sizeof(filename), "/cat", 4);
-
-#ifdef MONITOR_PASSWD
-    if (is_cat || is_sudo) {
-        char **argv_array = (char **)ctx->args[1];
-        char *arg_ptr = NULL;
-
-        if (is_cat) {
-            if (bpf_probe_read_user(&arg_ptr, sizeof(arg_ptr), &argv_array[1]) == 0 && arg_ptr) {
-                long arg_ret = bpf_probe_read_user_str(arg_buf, sizeof(arg_buf) - 1, arg_ptr);
-                if (arg_ret == 12 && str_eq(arg_buf, "/etc/passwd", 11))
-                    flags |= FLAG_PASSWD_READ;
-            }
-        } else if (is_sudo) {
-            char *arg1_ptr = NULL, *arg2_ptr = NULL;
-            if (bpf_probe_read_user(&arg1_ptr, sizeof(arg1_ptr), &argv_array[1]) != 0)
-                goto done;
-            if (bpf_probe_read_user(&arg2_ptr, sizeof(arg2_ptr), &argv_array[2]) != 0)
-                goto done;
-            if (arg1_ptr && arg2_ptr) {
-                long a1 = bpf_probe_read_user_str(arg_buf, 5, arg1_ptr);
-                if (a1 == 5 && arg_buf[0] == 'c' && arg_buf[1] == 'a' && arg_buf[2] == 't' && arg_buf[3] == '\0') {
-                    long a2 = bpf_probe_read_user_str(arg_buf, sizeof(arg_buf) - 1, arg2_ptr);
-                    if (a2 == 12 && str_eq(arg_buf, "/etc/passwd", 11))
-                        flags |= FLAG_PASSWD_READ;
-                }
-            }
-        }
-    }
-#endif /* MONITOR_PASSWD */
+    (void)is_cat;
 
 done:
     {
@@ -448,23 +424,14 @@ int trace_ptrace(struct trace_event_raw_sys_enter *ctx)
 static __always_inline __u8 classify_path_flags(char *path, long ret, int buf_len)
 {
     __u8 flags = 0;
-
-    if (ret == 12 && str_eq(path, "/etc/shadow", 11)) {
-        flags |= FLAG_SENSITIVE_FILE;
-    } else if (ret == 13 && str_eq(path, "/etc/sudoers", 12)) {
-        flags |= FLAG_SENSITIVE_FILE;
-    } else if (ret >= 17 && ends_with(path, ret, buf_len, "/authorized_keys", 16)) {
-        flags |= FLAG_SENSITIVE_FILE;
-    } else if (ret >= 12 && str_eq(path, "/etc/passwd", 11)) {
-        flags |= FLAG_PASSWD_READ;
-    } else if (ret >= 5 && path[0] == '/' && path[1] == 't' && path[2] == 'm' && path[3] == 'p' &&
-               (path[4] == '/' || ret == 5)) {
+    if (ret >= 5 && path[0] == '/' && path[1] == 't' && path[2] == 'm' && path[3] == 'p' &&
+        (path[4] == '/' || ret == 5)) {
         flags |= FLAG_TMP_FILE;
     }
     return flags;
 }
 
-static __always_inline void try_emit_file_open_sampled(void)
+static __always_inline void try_emit_file_open_sampled(char *path, long ret)
 {
     __u32 key = 0;
     __u64 now = bpf_ktime_get_ns();
@@ -481,7 +448,10 @@ static __always_inline void try_emit_file_open_sampled(void)
     if (v->count >= max_per_sec)
         return;
     v->count++;
-    emit_event(EVENT_OPENAT, 0, 0, 0, 0, NULL);
+    __u32 path_len = (__u32)(ret - 1);
+    if (path_len > MAX_EXEC_PATH)
+        path_len = MAX_EXEC_PATH;
+    emit_path_event(EVENT_OPENAT, 0, path, path_len);
 }
 
 SEC("tracepoint/syscalls/sys_enter_openat")
@@ -494,11 +464,14 @@ int trace_openat(struct trace_event_raw_sys_enter *ctx)
         return 0;
 
     __u8 flags = classify_path_flags(path, ret, sizeof(path));
+    __u32 path_len = (__u32)(ret - 1);
+    if (path_len > MAX_EXEC_PATH)
+        path_len = MAX_EXEC_PATH;
 
     if (flags)
-        emit_event(EVENT_OPENAT, flags, 0, 0, 0, NULL);
+        emit_path_event(EVENT_OPENAT, flags, path, path_len);
     else
-        try_emit_file_open_sampled();
+        try_emit_file_open_sampled(path, ret);
 
     return 0;
 }
@@ -515,10 +488,13 @@ int trace_open(struct trace_event_raw_sys_enter *ctx)
         return 0;
 
     __u8 flags = classify_path_flags(path, ret, sizeof(path));
+    __u32 path_len = (__u32)(ret - 1);
+    if (path_len > MAX_EXEC_PATH)
+        path_len = MAX_EXEC_PATH;
     if (flags)
-        emit_event(EVENT_OPENAT, flags, 0, 0, 0, NULL);
+        emit_path_event(EVENT_OPENAT, flags, path, path_len);
     else
-        try_emit_file_open_sampled();
+        try_emit_file_open_sampled(path, ret);
 
     return 0;
 }
@@ -535,10 +511,13 @@ int trace_openat2(struct trace_event_raw_sys_enter *ctx)
         return 0;
 
     __u8 flags = classify_path_flags(path, ret, sizeof(path));
+    __u32 path_len = (__u32)(ret - 1);
+    if (path_len > MAX_EXEC_PATH)
+        path_len = MAX_EXEC_PATH;
     if (flags)
-        emit_event(EVENT_OPENAT, flags, 0, 0, 0, NULL);
+        emit_path_event(EVENT_OPENAT, flags, path, path_len);
     else
-        try_emit_file_open_sampled();
+        try_emit_file_open_sampled(path, ret);
 
     return 0;
 }

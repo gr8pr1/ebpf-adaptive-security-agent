@@ -23,17 +23,21 @@ baseline:
   aggregation_window: 1m
   recalibration_interval: 24h
   ewma_alpha: 0.01
+  fast_trend_alpha: 0.1              # fast EWMA trend term for organic growth detrending
   min_stddev: 1.0                    # floor to prevent +Inf z-scores on constant dimensions
   state_file: /var/lib/ebpf-agent/baseline.db
   new_dimension_learn_window: 24h    # fast-track learning window for cold-start dimensions
+  fast_track_hold_high_severity: true # do not auto-normalize high-severity new dimensions in fast-track
 
 # Anomaly scoring thresholds
 scoring:
   zscore_threshold: 3.0
   minimum_samples: 15
-  cold_start_severity: warning       # severity for dimensions seen for the first time post-learning
+  cold_start_severity: warning       # downgraded to info at runtime for cold-start
   mad_enabled: false                 # use robust median/MAD scoring when true
   ceilings: {}                       # optional per-metric hard caps, e.g. ptrace: 10
+  ceiling_multiplier: 3.0            # when >0, ceilings are relative to baseline mean (mean * multiplier)
+  maintenance_windows: []            # optional alert suppression, e.g. days: [sun], start_hour: 2, end_hour: 4
 
 # Container monitoring (requires cgroup v2)
 container_monitoring:
@@ -48,10 +52,41 @@ dimensions:
   network: true
   filesystem: true
   scheduling: true
+  normalize_binary_version: true     # strip version suffixes from binary names (python3.11 -> python3)
+  prefer_image_name: true            # prefer container image over instance ID in dimension keys
 
-# Detection tuning (kernel BPF maps populated at startup)
+# Detection tuning (kernel BPF maps + userspace rule tracks)
 detection:
   suspicious_ports: [4444, 1337, 5555, 6666, 8443, 1234, 31337]
+  sensitive_paths: ["/etc/shadow", "/etc/sudoers", "/root/.ssh/authorized_keys"]
+  supervisor_roots: [systemd, dockerd, containerd, kubelet, runc]
+  event_rules:
+    - name: ptrace
+      event_types: [ptrace]
+      severity: critical
+    - name: capset
+      event_types: [capset]
+      severity: warning
+    - name: suspicious_connect
+      event_types: [connect]
+      flags: [suspicious_port]
+      severity: warning
+    - name: sensitive_file
+      event_types: [openat]
+      flags: [sensitive_file]
+      severity: warning
+    - name: setuid
+      event_types: [setuid, setgid]
+      severity: warning
+    - name: sudo
+      event_types: [exec]
+      flags: [sudo]
+      severity: warning
+  composite_rules:
+    - name: shell_exec_then_connect
+      sequence: [exec, connect]
+      window: 30s
+      severity: warning
 
 # Tracepoints to attach eBPF programs to
 tracepoints:
@@ -128,7 +163,6 @@ otel:
     suspicious_connect: 1.0
     capset: 1.0
     sensitive_file: 1.0
-    passwd_read: 1.0
     setuid: 1.0
     sudo: 1.0
     bind: 0.1

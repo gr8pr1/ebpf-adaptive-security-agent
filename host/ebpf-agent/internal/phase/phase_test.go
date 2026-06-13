@@ -11,7 +11,7 @@ import (
 
 func TestProcessWindowColdStartBeforeIngest(t *testing.T) {
 	eng := baseline.NewEngine(0.01, 2)
-	sc := scorer.New(eng, 3.0, 1.0, "warning", nil, false)
+	sc := scorer.New(eng, 3.0, 1.0, "warning", nil, false, 0, nil)
 
 	var gotColdStart bool
 	mgr := NewManager(eng, sc, nil, time.Hour, time.Hour, func(results []scorer.Result, w *aggregator.Window) {
@@ -44,7 +44,7 @@ func TestProcessWindowColdStartBeforeIngest(t *testing.T) {
 
 func TestProcessWindowIngestsNonAnomalousOnly(t *testing.T) {
 	eng := baseline.NewEngine(0.01, 2)
-	sc := scorer.New(eng, 3.0, 1.0, "warning", map[string]float64{"ptrace": 5}, false)
+	sc := scorer.New(eng, 3.0, 1.0, "warning", map[string]float64{"ptrace": 5}, false, 0, nil)
 
 	mgr := NewManager(eng, sc, nil, time.Hour, time.Hour, nil)
 	mgr.SetPhaseForTest(PhaseMonitoring)

@@ -38,19 +38,22 @@ sudo ./ebpf-agent
 
 ## Adding a New Monitor
 
-1. **BPF**: Add a new tracepoint program, per-CPU counter map, and ringbuf `emit_event()` call in `bpf/exec.bpf.c`. Gate it behind a `MONITOR_*` flag.
+1. **BPF**: Add a new tracepoint program and ringbuf `emit_event()` / `emit_exec_event()` call in `bpf/exec.bpf.c`. Gate it behind a `MONITOR_*` flag. Use the 72-byte `ebpf_event` header; exec events may append a filename tail.
 2. **Makefile**: Add the new flag to the Makefile.
 3. **Config**: Add the tracepoint and metric entries in `config.yaml`.
 4. **Aggregator**: Add the event type mapping in `internal/aggregator/aggregator.go`.
 5. **MITRE Mapper**: Add the technique mapping in `internal/mitre/mitre.go`.
 6. **Tests**: Update `internal/config/config_test.go`.
-7. **Docs**: Update `README.md` and `ARCHITECTURE.md`.
+7. **Docs**: Update `README.md`, `ARCHITECTURE.md`, and log the change in `state.md`.
 
 ## Testing
 
 ```bash
 # Run unit tests
 make test
+
+# Run integration replay harness
+go test -tags=integration ./internal/integration/...
 
 # Test the agent manually
 sudo ./ebpf-agent

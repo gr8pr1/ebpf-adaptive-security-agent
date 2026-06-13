@@ -24,7 +24,7 @@ type replayHarness struct {
 func newHarness(t *testing.T, minSamples int, ceilings map[string]float64) *replayHarness {
 	t.Helper()
 	eng := baseline.NewEngine(0.01, minSamples)
-	sc := scorer.New(eng, 3.0, 1.0, "warning", ceilings, false)
+	sc := scorer.New(eng, 3.0, 1.0, "warning", ceilings, false, 0, nil)
 	var lastResults []scorer.Result
 	mgr := phase.NewManager(eng, sc, nil, time.Hour, time.Hour, func(results []scorer.Result, w *aggregator.Window) {
 		lastResults = append([]scorer.Result(nil), results...)
@@ -147,7 +147,7 @@ func TestReplaySamplingKeyParity(t *testing.T) {
 	sampling := map[string]float64{
 		"suspicious_connect": 1.0,
 		"sudo":               1.0,
-		"passwd_read":        1.0,
+		"sensitive_file":     1.0,
 		"connect":            0.01,
 		"exec":               0.01,
 	}
@@ -161,7 +161,7 @@ func TestReplaySamplingKeyParity(t *testing.T) {
 		{"suspicious_connect", ringbuf.EventConnect, ringbuf.FlagSuspiciousPort, 1.0},
 		{"plain_connect", ringbuf.EventConnect, 0, 0.01},
 		{"sudo_exec", ringbuf.EventExec, ringbuf.FlagSudo, 1.0},
-		{"passwd_open", ringbuf.EventOpenat, ringbuf.FlagPasswdRead, 1.0},
+		{"sensitive_open", ringbuf.EventOpenat, ringbuf.FlagSensitiveFile, 1.0},
 	}
 
 	for _, tc := range cases {

@@ -9,7 +9,7 @@ import (
 )
 
 func TestUniqueDestIPsMetric(t *testing.T) {
-	a := New(time.Minute, true, true, false, true, true, true)
+	a := New(time.Minute, true, true, false, true, true, true, true, true)
 	ev := &enricher.EnrichedEvent{
 		Raw: &ringbuf.Event{
 			EventType: ringbuf.EventConnect,

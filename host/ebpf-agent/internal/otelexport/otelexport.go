@@ -278,9 +278,6 @@ func samplingKey(eventType uint8, flags uint8) string {
 	case ringbuf.EventDNS:
 		return "dns"
 	case ringbuf.EventOpenat:
-		if flags&ringbuf.FlagPasswdRead != 0 {
-			return "passwd_read"
-		}
 		if flags&ringbuf.FlagSensitiveFile != 0 {
 			return "sensitive_file"
 		}
@@ -288,9 +285,6 @@ func samplingKey(eventType uint8, flags uint8) string {
 	case ringbuf.EventExec:
 		if flags&ringbuf.FlagSudo != 0 {
 			return "sudo"
-		}
-		if flags&ringbuf.FlagPasswdRead != 0 {
-			return "passwd_read"
 		}
 		return "exec"
 	case ringbuf.EventSetuid:

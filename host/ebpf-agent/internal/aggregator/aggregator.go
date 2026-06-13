@@ -2,10 +2,10 @@ package aggregator
 
 import (
 	"fmt"
-	"path/filepath"
 	"sync"
 	"time"
 
+	"ebpf-agent/internal/dimkey"
 	"ebpf-agent/internal/enricher"
 	"ebpf-agent/internal/ringbuf"
 )
@@ -29,14 +29,16 @@ type Window struct {
 
 // Aggregator collects enriched events into time-bucketed windows.
 type Aggregator struct {
-	windowSize   time.Duration
-	perUser      bool
-	perProcess   bool
-	perCont      bool
-	network      bool
-	filesystem   bool
-	scheduling   bool
-	uniqueDestIP map[DimensionKey]map[string]struct{}
+	windowSize           time.Duration
+	perUser              bool
+	perProcess           bool
+	perCont              bool
+	network              bool
+	filesystem           bool
+	scheduling           bool
+	normalizeBinary      bool
+	preferImageName      bool
+	uniqueDestIP         map[DimensionKey]map[string]struct{}
 
 	pidExecNs map[uint32]uint64
 	ppidForks map[uint32]float64
@@ -45,7 +47,9 @@ type Aggregator struct {
 	current *Window
 }
 
-func New(windowSize time.Duration, perUser, perProcess, perContainer, network, filesystem, scheduling bool) *Aggregator {
+func New(windowSize time.Duration, perUser, perProcess, perContainer, network, filesystem, scheduling bool,
+	normalizeBinary, preferImage bool,
+) *Aggregator {
 	now := time.Now()
 	return &Aggregator{
 		windowSize:   windowSize,
@@ -54,8 +58,10 @@ func New(windowSize time.Duration, perUser, perProcess, perContainer, network, f
 		perCont:      perContainer,
 		network:      network,
 		filesystem:   filesystem,
-		scheduling:   scheduling,
-		uniqueDestIP: make(map[DimensionKey]map[string]struct{}),
+		scheduling:      scheduling,
+		normalizeBinary: normalizeBinary,
+		preferImageName: preferImage,
+		uniqueDestIP:    make(map[DimensionKey]map[string]struct{}),
 		pidExecNs:    make(map[uint32]uint64),
 		ppidForks:    make(map[uint32]float64),
 		current: &Window{
@@ -94,14 +100,13 @@ func (a *Aggregator) dimensionKey(metricName string, ev *enricher.EnrichedEvent)
 		key.User = ev.Username
 	}
 	if a.perProcess {
-		if ev.Resolved && ev.Binary != "" {
-			key.Process = "bin:" + filepath.Base(ev.Binary)
-		} else {
-			key.Process = "comm:" + ev.Raw.CommString()
+		label := dimkey.ProcessLabel(ev.Binary, ev.Raw.CommString(), a.normalizeBinary)
+		if label != "" {
+			key.Process = label
 		}
 	}
 	if a.perCont && ev.Container != "" {
-		key.Container = ev.Container
+		key.Container = dimkey.NormalizeContainer(ev.Container, a.preferImageName)
 	}
 	return key
 }
@@ -201,9 +206,6 @@ func eventTypeToMetric(evType uint8, flags uint8) string {
 		if flags&ringbuf.FlagSudo != 0 {
 			return "sudo"
 		}
-		if flags&ringbuf.FlagPasswdRead != 0 {
-			return "passwd_read_exec"
-		}
 		return "exec"
 	case ringbuf.EventConnect:
 		if flags&ringbuf.FlagSuspiciousPort != 0 {
@@ -213,9 +215,6 @@ func eventTypeToMetric(evType uint8, flags uint8) string {
 	case ringbuf.EventPtrace:
 		return "ptrace"
 	case ringbuf.EventOpenat:
-		if flags&ringbuf.FlagPasswdRead != 0 {
-			return "passwd_read_open"
-		}
 		if flags&ringbuf.FlagSensitiveFile != 0 {
 			return "sensitive_file"
 		}

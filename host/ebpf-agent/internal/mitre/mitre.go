@@ -166,11 +166,6 @@ func mapConnect(ev *enricher.EnrichedEvent) Mapping {
 }
 
 func mapOpenat(ev *enricher.EnrichedEvent) Mapping {
-	if ev.Raw.Flags&ringbuf.FlagPasswdRead != 0 {
-		return Mapping{Techniques: []Technique{
-			{ID: "T1003.008", Name: "/etc/passwd and /etc/shadow", Tactic: "Credential Access"},
-		}}
-	}
 	if ev.Raw.Flags&ringbuf.FlagSensitiveFile != 0 {
 		return Mapping{Techniques: []Technique{
 			{ID: "T1003.008", Name: "/etc/passwd and /etc/shadow", Tactic: "Credential Access"},

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"ebpf-agent/internal/ringbuf"
+	"ebpf-agent/internal/sensitive"
 )
 
 type EnrichedEvent struct {
@@ -35,6 +36,7 @@ const (
 
 type Enricher struct {
 	cgroupRoot string
+	sensitive  *sensitive.Matcher
 
 	userCache     map[uint32]string
 	userMu        sync.RWMutex
@@ -53,9 +55,14 @@ type cgroupEntry struct {
 	expires time.Time
 }
 
-func New(cgroupRoot string) *Enricher {
+func New(cgroupRoot string, sensitivePaths []string) *Enricher {
+	paths := sensitivePaths
+	if len(paths) == 0 {
+		paths = sensitive.DefaultPaths()
+	}
 	e := &Enricher{
 		cgroupRoot:  cgroupRoot,
+		sensitive:   sensitive.New(paths),
 		userCache:   make(map[uint32]string),
 		pidCache:    make(map[uint32]*list.Element),
 		pidOrder:    list.New(),
@@ -74,13 +81,21 @@ func (e *Enricher) Enrich(ev *ringbuf.Event) *EnrichedEvent {
 	} else {
 		binary, resolved = e.resolveBinary(ev.PID)
 	}
-	return &EnrichedEvent{
+
+	out := &EnrichedEvent{
 		Raw:       ev,
 		Binary:    binary,
 		Username:  e.resolveUser(ev.UID),
 		Container: e.resolveContainer(ev.PID, ev.CgroupID),
 		Resolved:  resolved,
 	}
+
+	if ev.EventType == ringbuf.EventOpenat && ev.OpenPath() != "" && e.sensitive != nil {
+		if e.sensitive.Match(ev.OpenPath()) {
+			out.Raw.Flags |= ringbuf.FlagSensitiveFile
+		}
+	}
+	return out
 }
 
 func (e *Enricher) resolveBinary(pid uint32) (string, bool) {

@@ -10,36 +10,42 @@ Mermaid sources for the host agent (`host/ebpf-agent`). Render in GitHub, GitLab
 flowchart TB
     subgraph Host["Linux host"]
         subgraph Kernel["Kernel space"]
-            TP["Tracepoint programs\nexecve, connect, ptrace, ..."]
-            PC["Per-CPU counter maps"]
-            RB["RingBuf map\nevents"]
-            TP --> PC
+            TP["15 tracepoint programs\nexecve, connect, ptrace,\nopen/openat/openat2, write,\nsetuid/setgid, fork, exit,\nbind, sendto, capset, oom"]
+            RB["RingBuf map\n72-byte header +\noptional exec filename"]
+            DROPS["ringbuf_drops map"]
             TP --> RB
+            TP --> DROPS
         end
 
         subgraph Agent["ebpf-agent userspace"]
             RC["RingBuf consumer"]
-            EN["Enricher\nPID LRU, UID, cgroup"]
-            MT["MITRE mapper\nMitreTags"]
+            EN["Enricher\nexec filename in-kernel,\nPID LRU, UID, cgroup"]
+            MT["MITRE mapper + kill-chain\nMitreTags, ppid lineage"]
             AG["Aggregator\n1-min windows"]
             BL["Baseline engine\n168 seasonal buckets + EWMA"]
-            ST[("SQLite\nbaseline.db")]
+            ST[("SQLite\nbaseline.db v2")]
             PH["Phase manager\nlearning / monitoring"]
-            SC["Scorer\nz-score, min stddev, cold-start"]
+            SC["Scorer\nz-score / MAD, cold-start"]
+            OTEL["OTel exporter\nLogRecords, spans, metrics"]
         end
 
         RB --> RC --> EN --> MT --> AG
         AG --> PH
-        PH --> BL
-        BL <--> ST
         PH --> SC
+        SC -->|"non-anomalous only"| BL
+        BL <--> ST
+        EN -->|"high-value events"| OTEL
+        SC -->|"anomalies"| OTEL
+        MT -->|"kill-chain"| OTEL
     end
 
     J["journald\nANOMALY, COLD-START, ENRICH-FAIL"]
     HM["HTTP :9110 /metrics\nhealth gauges only"]
+    COL["OTel Collector\nOTLP gRPC"]
 
     SC --> J
     PH --> HM
+    OTEL --> COL
 ```
 
 ---
@@ -48,17 +54,19 @@ flowchart TB
 
 ```mermaid
 flowchart LR
-    A["Syscall fires"] --> B["BPF: counters + ringbuf record\npid, uid, cgroup, comm, flags"]
-    B --> C["Go: parse event"]
-    C --> D["Enrich: /proc, passwd, cgroup label"]
-    D --> E["MITRE: technique IDs on event"]
+    A["Syscall fires"] --> B["BPF: ringbuf record\npid, ppid, uid, cgroup, comm, flags"]
+    B --> C["Go: parse 72B header +\noptional exec filename"]
+    C --> D["Enrich: in-kernel path for exec,\n/proc LRU for others, passwd, cgroup"]
+    D --> E["MITRE: technique IDs + kill-chain observe"]
     E --> F["Aggregate: dimension keys\nper user / comm / container"]
     F --> G["Window tick: rotate 1m"]
-    G --> H["Phase: ingest into baseline"]
-    H --> I{"Monitoring phase?"}
-    I -->|no| H
-    I -->|yes| J["Score vs baseline"]
-    J --> K["Log anomalies"]
+    G --> H{"Monitoring phase?"}
+    H -->|no| I["Ingest into baseline"]
+    H -->|yes| J["Score vs baseline first"]
+    J --> K["Log + OTel export anomalies"]
+    J --> L["Ingest non-anomalous dimensions only"]
+    I --> G
+    L --> G
 ```
 
 ---
@@ -72,7 +80,7 @@ flowchart TB
     L1 --> L2{"learning_duration elapsed?"}
     L2 -->|no| L1
     L2 -->|yes| M["Phase 2: Monitoring"]
-    M --> M1["Per window: ingest, score,\nlog anomalies, EWMA"]
+    M --> M1["Per window: score first,\ningest non-anomalous only,\nlog + OTel anomalies"]
     M1 --> M
     M --> R["Reset / reconfigure"]
     R --> L
@@ -86,19 +94,16 @@ flowchart TB
 flowchart TB
     subgraph Detection["Detection output"]
         LOG["Structured text logs\njournald"]
+        OTEL["OTLP to collector\nLogRecords, anomaly spans,\nkill-chain spans, metrics"]
     end
 
     subgraph Health["Operational health"]
         PROM["Prometheus scrape\nlocalhost:9110/metrics"]
     end
 
-    subgraph Planned["Not implemented"]
-        OTEL["OTLP to collector\ntraces / logs / metrics"]
-    end
-
     Agent["ebpf-agent"] --> LOG
+    Agent --> OTEL
     Agent --> PROM
-    Agent -.->|planned| OTEL
 ```
 
 ---

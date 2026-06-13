@@ -11,18 +11,18 @@ A host-adapting security monitoring agent that uses eBPF to learn normal system 
 
 The agent attaches eBPF programs to kernel tracepoints to observe syscalls at the kernel level. Events flow through a structured pipeline:
 
-1. **Kernel**: Tracepoint programs capture syscall metadata (pid, uid, cgroup, process name) and push structured events to a ringbuf.
-2. **Enrichment**: The Go agent drains the ringbuf, resolves PIDs to binaries (TTL LRU cache), UIDs to usernames (refreshed from `/etc/passwd`), and cgroup paths to container IDs where available.
-3. **MITRE Mapping**: Each enriched event is mapped to MITRE ATT&CK techniques using context-aware resolution (binary path, comm, flags, destination port).
+1. **Kernel**: Tracepoint programs capture syscall metadata (pid, ppid, uid, cgroup, process name) and push structured events to a ringbuf (72-byte header; exec events append filename tail).
+2. **Enrichment**: The Go agent drains the ringbuf. Exec events use the in-kernel filename (no TOCTOU). Other events resolve PIDs via TTL LRU cache, UIDs via refreshed `/etc/passwd`, cgroup paths to container IDs.
+3. **MITRE Mapping**: Each enriched event is mapped to MITRE ATT&CK techniques. `ChainDetector` correlates `ppid` lineage for kill-chain spans (exec→connect patterns).
 4. **Aggregation**: Events are bucketed into 1-minute windows per dimension (user, process, container, metric type).
 5. **Baselining**: A 168-bucket seasonal model (24 hours x 7 days) tracks per-dimension EWMA mean and variance per hour-of-week. Neighbor buckets are used when a seasonal slot lacks enough samples.
-6. **Scoring**: In monitoring, each window is scored **before** ingest. Anomalous dimensions are not folded into the baseline. Z-score (or optional MAD) uses EWMA-blended stats with a minimum stddev floor. New dimensions post-learning trigger cold-start alerts.
+6. **Scoring**: In monitoring, each window is scored **before** ingest. Anomalous dimensions are not folded into the baseline. Z-score (or MAD when skewness warrants) uses EWMA-blended stats with a minimum stddev floor. New dimensions enter a 24h fast-track before full cold-start alerting.
 
 ### Two-Phase Operation
 
 **Phase 1 — Learning** (default: 7 days): The agent collects events and builds per-dimension, per-time-of-day baselines. High-value security events (ptrace, capset, suspicious connections) are still logged during this phase.
 
-**Phase 2 — Monitoring**: Each aggregation window is scored against EWMA-blended baselines; anomalous dimension keys are excluded from ingest so bursts cannot poison statistics. Anomalies are emitted to **OpenTelemetry** (when `otel.enabled`) and **journald** (severity, z-score, dimension). High-value events (suspicious connect, sudo, sensitive file, passwd read) export at full sampling rates when OTel tracing is enabled. MITRE technique IDs are attached to enriched events; **security-event** OTLP spans include `mitre.technique.ids` when trace export is on.
+**Phase 2 — Monitoring**: Each aggregation window is scored against EWMA-blended baselines; anomalous dimension keys are excluded from ingest. Anomalies go to **OpenTelemetry** (when `otel.enabled`) and **journald**. High-value events export as OTLP **LogRecords** (and optional spans). Kill-chain patterns emit `mitre.kill_chain` spans. MITRE technique IDs attach to enriched events.
 
 ## MITRE ATT&CK Coverage
 
@@ -36,7 +36,7 @@ The agent maps kernel events to MITRE techniques using enrichment context, not j
 | T1036.003 | Rename System Utilities | `execve` + binary basename != comm | Name mismatch detection |
 | T1548.003 | Sudo and Sudo Caching | `execve` + sudo flag | BPF flag detection |
 | T1548.001 | Setuid and Setgid | `setuid()`/`setgid()`/`capset()` | Direct syscall |
-| T1003.008 | /etc/passwd and /etc/shadow | `openat()` on sensitive files | BPF flag detection |
+| T1003.008 | /etc/shadow and sudoers | `openat()` / `open()` / `openat2()` on sensitive files | Userspace inode/path match (`internal/sensitive`) |
 | T1055 | Process Injection | `ptrace()` | Direct syscall |
 | T1071.001 | Web Protocols | `connect()` to port 80/443 | Port-based classification |
 | T1571 | Non-Standard Port | `connect()` to C2 ports | BPF flag detection |
@@ -53,7 +53,9 @@ The agent maps kernel events to MITRE techniques using enrichment context, not j
 | **Process Activity** | `sys_enter_execve`, `sched_process_fork`, `sched_process_exit` | per-host, per-user, per-hour |
 | **Network** | `sys_enter_connect`, `sys_enter_bind`, `sys_enter_sendto` (DNS) | per-host, per-user, per-hour |
 | **Privilege Escalation** | `sys_enter_setuid`, `sys_enter_setgid`, `sys_enter_capset` | per-host, per-user |
-| **Sensitive Files** | `sys_enter_openat` (shadow, sudoers, authorized_keys) | per-host, per-hour |
+| **Sensitive Files** | `sys_enter_openat`, `sys_enter_open`, `sys_enter_openat2` | per-host, per-hour |
+| **File Writes** | `sys_enter_write` (rate-limited) | per-host, per-hour |
+| **OOM / Scheduling** | `oom/mark_victim`, fork-bomb via `sched_process_fork` | per-host |
 | **Process Injection** | `sys_enter_ptrace` | per-host |
 | **Per-User Profiling** | All above, keyed by UID | per-uid, per-hour |
 | **Per-Process Profiling** | All above, keyed by comm | per-comm, per-day |
@@ -138,7 +140,7 @@ Disable detection modules at compile time:
 make bpf MONITOR_CONNECT=0 MONITOR_PTRACE=0 MONITOR_DNS=0
 ```
 
-Available flags: `MONITOR_EXEC`, `MONITOR_SUDO`, `MONITOR_PASSWD`, `MONITOR_CONNECT`, `MONITOR_PTRACE`, `MONITOR_OPENAT`, `MONITOR_OPEN`, `MONITOR_OPENAT2`, `MONITOR_WRITE`, `MONITOR_SETUID`, `MONITOR_FORK`, `MONITOR_EXIT`, `MONITOR_BIND`, `MONITOR_DNS`, `MONITOR_CAPSET`, `MONITOR_OOM`.
+Available flags: `MONITOR_EXEC`, `MONITOR_SUDO`, `MONITOR_CONNECT`, `MONITOR_PTRACE`, `MONITOR_OPENAT`, `MONITOR_OPEN`, `MONITOR_OPENAT2`, `MONITOR_WRITE`, `MONITOR_SETUID`, `MONITOR_FORK`, `MONITOR_EXIT`, `MONITOR_BIND`, `MONITOR_DNS`, `MONITOR_CAPSET`, `MONITOR_OOM`. (`MONITOR_PASSWD` is deprecated — no BPF code path; sensitive matching is userspace.)
 
 ## Health Metrics
 
@@ -159,7 +161,7 @@ The `/metrics` endpoint exposes agent operational health, not security detection
 
 ## OpenTelemetry
 
-Set **`otel.enabled: true`** and point **`otel.endpoint`** at an OpenTelemetry Collector (**OTLP gRPC only**; default port **4317**). The `otel.protocol` field must be **`grpc`** (or omitted); HTTP/protobuf exporters are not implemented yet. The agent ships **`internal/otelexport`**: anomaly spans, security-relevant spans, and OTLP metric/log providers. See **`examples/otel-collector/otel-collector-config.yaml`**.
+Set **`otel.enabled: true`** and point **`otel.endpoint`** at an OpenTelemetry Collector (**OTLP gRPC only**; default port **4317**). The agent ships **`internal/otelexport`**: anomaly spans, security **LogRecords** (primary SIEM path), optional security spans, kill-chain spans, and OTLP metric/log providers. **`otel.batch`** configures trace/log batch processors. See **`examples/otel-collector/otel-collector-config.yaml`** (filter, tail_sampling, attributes, batch, routing connector).
 
 The default **`otel.insecure: true`** is for local collectors. For remote endpoints, set **`insecure: false`** and configure TLS/credentials appropriate to your environment.
 
@@ -214,7 +216,7 @@ host/ebpf-agent/
 │   ├── config/                  # YAML config parsing + validation
 │   ├── ringbuf/                 # Ringbuf consumer + event parsing
 │   ├── enricher/                # PID/UID/cgroup enrichment (TTL LRU cache)
-│   ├── mitre/                   # Context-aware MITRE ATT&CK mapper
+│   ├── mitre/                   # Context-aware MITRE mapper + kill-chain
 │   ├── aggregator/              # Time-window bucketing
 │   ├── baseline/                # 168-bucket seasonal model + EWMA scoring
 │   ├── scorer/                  # Z-score / MAD anomaly detection + cold-start
@@ -256,12 +258,13 @@ The agent does **not** export per-event counters or anomaly gauges to Prometheus
 
 - **Packet payload inspection** — sees destination port/IP but not data content
 - **Fileless malware** — `memfd_create` + `execveat` bypasses the `execve` tracepoint
-- **Path matching** — BPF uses a 64-byte path buffer; long paths, relative paths, and symlinks can evade exact string matches
+- **Path matching** — BPF emits bounded open paths; sensitive-file detection resolves symlinks/inodes in userspace (`internal/sensitive`). Residual TOCTOU: path is resolved after the open syscall. Exec events carry up to 128 bytes of filename from kernel.
 - **Failed syscalls** — `sys_enter_*` tracepoints fire before the kernel returns; EPERM/refused operations look the same as successes
-- **Cross-host correlation** — each agent is independent (planned: OTel-based fleet correlation)
+- **Cross-host correlation** — each agent is independent; fleet correlation via OTel Gateway is planned
 - **Kernel rootkits** — malicious kernel modules can hide events from eBPF
 - **DNS tunneling** — counts DNS queries but does not inspect query content
 - **LD_PRELOAD injection** — shared library hijacking does not trigger `ptrace()` or `execve()`
+- **Network bytes** — `bytes_tx/rx` metrics not yet implemented (no cgroup byte counters attached)
 
 ## Security Considerations
 
@@ -286,6 +289,20 @@ Refined Next Implementations (ARCHITECTURE P1–P7):
 | **P6 Kill-chain** | Open-source temporal MITRE correlation via `ppid` + OTel spans |
 | **P7 Scorer** | 32-sample observation ring; auto MAD when \|skewness\| > 1 |
 
+## Changelog (2026-06-13)
+
+Detection FP/FN Hardening — reduced false positives and false negatives:
+
+| Area | Change |
+|---|---|
+| **Sensitive files** | Dropped `/etc/passwd` BPF flagging; userspace inode/path match (`internal/sensitive`) for shadow/sudoers/authorized_keys |
+| **Scorer** | Confidence-weighted severity; context-relative ceilings; maintenance-window suppression |
+| **Dimensions** | Deploy-churn normalization (version-stripped binaries, container image preference) |
+| **Rules** | Config-driven event rule track (`detection.event_rules`); composite correlation rules |
+| **Novelty** | First-seen `(process, dest_ip, port)` tuples + beacon check (SQLite-backed) |
+| **Kill-chain** | Rebuilt on reuse-safe process table; supervisor exclusion; derived MITRE techniques |
+| **Baseline** | Two-timescale EWMA (fast trend + slow variance); fast-track hold for high-severity dimensions |
+
 ## Changelog (2026-06-12)
 
 Bug Fix Sprint — correctness and detection reliability:
@@ -295,9 +312,9 @@ Bug Fix Sprint — correctness and detection reliability:
 | **Phase / scoring** | Score before ingest in monitoring; skip anomalous dimensions from baseline (fixes dead cold-start + poisoning) |
 | **BPF** | Fix `/etc/shadow` and `/etc/sudoers` path length checks; IPv6 dest IP via stack `memcpy`; kernel `ringbuf_drops` counter |
 | **Baseline** | EWMA mean/variance used for scoring; neighbor-bucket fallback; legacy snapshot backfill on restore |
-| **OTel** | Flag-aware sampling (`suspicious_connect`, `sudo`, `passwd_read`, `sensitive_file` at 100%) |
+| **OTel** | Flag-aware sampling (`suspicious_connect`, `sudo`, `sensitive_file` at 100%) |
 | **Enricher** | TTL LRU PID cache, periodic `/etc/passwd` refresh, cgroup path → container ID |
-| **MITRE** | Fork/exit no longer tagged; `passwd_read_exec` / `passwd_read_open` separate metrics |
+| **MITRE** | Fork/exit no longer tagged; sensitive-file open via userspace inode match |
 | **Config** | `detection.suspicious_ports` BPF map; `minimum_samples` default 15; validation for durations and basic_auth |
 | **Persistence** | SQLite WAL + busy_timeout; state file chmod 0600 on save |
 | **Tests** | `phase`, `baseline`, `otelexport`, `mitre` unit tests |

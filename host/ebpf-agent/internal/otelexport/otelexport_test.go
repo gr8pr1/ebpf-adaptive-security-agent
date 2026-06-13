@@ -12,7 +12,6 @@ func TestSampleRateFlagAwareness(t *testing.T) {
 		"suspicious_connect": 1.0,
 		"exec":               0.01,
 		"sudo":               1.0,
-		"passwd_read":        1.0,
 		"sensitive_file":     1.0,
 	}
 
@@ -24,9 +23,6 @@ func TestSampleRateFlagAwareness(t *testing.T) {
 	}
 	if got := SampleRate(m, ringbuf.EventExec, ringbuf.FlagSudo); got != 1.0 {
 		t.Fatalf("sudo exec: got %f want 1.0", got)
-	}
-	if got := SampleRate(m, ringbuf.EventExec, ringbuf.FlagPasswdRead); got != 1.0 {
-		t.Fatalf("passwd exec: got %f want 1.0", got)
 	}
 	if got := SampleRate(m, ringbuf.EventOpenat, ringbuf.FlagSensitiveFile); got != 1.0 {
 		t.Fatalf("sensitive openat: got %f want 1.0", got)

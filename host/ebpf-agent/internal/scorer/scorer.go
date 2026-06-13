@@ -2,24 +2,27 @@ package scorer
 
 import (
 	"math"
+	"strings"
 	"time"
 
 	"ebpf-agent/internal/aggregator"
 	"ebpf-agent/internal/baseline"
+	"ebpf-agent/internal/config"
 )
 
 const skewnessMADThreshold = 1.0
 
 type Result struct {
-	Key       aggregator.DimensionKey
-	Observed  float64
-	Mean      float64
-	StdDev    float64
-	ZScore    float64
-	Anomaly   bool
-	Severity  string
-	ColdStart bool
-	UsedMAD   bool
+	Key        aggregator.DimensionKey
+	Observed   float64
+	Mean       float64
+	StdDev     float64
+	ZScore     float64
+	Anomaly    bool
+	Severity   string
+	ColdStart  bool
+	UsedMAD    bool
+	Confidence float64
 }
 
 type Scorer struct {
@@ -30,10 +33,13 @@ type Scorer struct {
 	madEnabled          bool
 	autoSkewness        bool
 	ceilings            map[string]float64
+	ceilingMultiplier   float64
+	maintenanceWindows  []config.MaintenanceWindowConfig
 }
 
 func New(engine *baseline.Engine, zscoreThreshold, minStdDev float64, coldStartSeverity string,
-	ceilings map[string]float64, madEnabled bool,
+	ceilings map[string]float64, madEnabled bool, ceilingMultiplier float64,
+	maintenance []config.MaintenanceWindowConfig,
 ) *Scorer {
 	if minStdDev <= 0 {
 		minStdDev = 1.0
@@ -45,17 +51,23 @@ func New(engine *baseline.Engine, zscoreThreshold, minStdDev float64, coldStartS
 		ceilings = map[string]float64{}
 	}
 	return &Scorer{
-		engine:            engine,
-		threshold:         zscoreThreshold,
-		minStdDev:         minStdDev,
-		coldStartSeverity: coldStartSeverity,
-		madEnabled:        madEnabled,
-		autoSkewness:      true,
-		ceilings:          ceilings,
+		engine:             engine,
+		threshold:          zscoreThreshold,
+		minStdDev:          minStdDev,
+		coldStartSeverity:  coldStartSeverity,
+		madEnabled:         madEnabled,
+		autoSkewness:       true,
+		ceilings:           ceilings,
+		ceilingMultiplier:  ceilingMultiplier,
+		maintenanceWindows: maintenance,
 	}
 }
 
 func (s *Scorer) Score(w *aggregator.Window) []Result {
+	if s.inMaintenanceWindow(w.Start) {
+		return nil
+	}
+
 	hour := w.Start.Hour()
 	dow := int(w.Start.Weekday())
 
@@ -72,15 +84,14 @@ func (s *Scorer) Score(w *aggregator.Window) []Result {
 			continue
 		}
 
-		if max, ok := s.ceilings[key.MetricName]; ok && max > 0 && observed > max {
+		if s.ceilingTriggered(key, observed, hour, dow) {
+			conf := s.bucketConfidence(key, hour, dow)
 			results = append(results, Result{
-				Key:      key,
-				Observed: observed,
-				Mean:     0,
-				StdDev:   0,
-				ZScore:   1e6,
-				Anomaly:  true,
-				Severity: "critical",
+				Key:        key,
+				Observed:   observed,
+				Anomaly:    true,
+				Severity:   s.severityFromConfidence("warning", conf, false),
+				Confidence: conf,
 			})
 			continue
 		}
@@ -94,8 +105,9 @@ func (s *Scorer) Score(w *aggregator.Window) []Result {
 				Key:       key,
 				Observed:  observed,
 				Anomaly:   true,
-				Severity:  s.coldStartSeverity,
+				Severity:  s.adjustColdStartSeverity(s.coldStartSeverity),
 				ColdStart: true,
+				Confidence: 0,
 			})
 			continue
 		}
@@ -108,49 +120,58 @@ func (s *Scorer) Score(w *aggregator.Window) []Result {
 			}
 		}
 
-		var mean, stddev, median, mad float64
+		var mean, stddev, median, mad, fastEWMA, confidence float64
 		var ready bool
 		if useMAD {
-			mean, stddev, _, median, mad, ready = s.engine.LookupRobust(key, hour, dow)
+			mean, stddev, _, fastEWMA, median, mad, confidence, ready = s.engine.LookupRobust(key, hour, dow)
 		} else {
-			mean, stddev, _, ready = s.engine.Lookup(key, hour, dow)
+			var ewma float64
+			mean, stddev, ewma, fastEWMA, confidence, ready = s.engine.Lookup(key, hour, dow)
+			_ = ewma
 		}
 
 		if !ready {
 			continue
 		}
 
+		detrended := observed
+		if fastEWMA > 0 {
+			detrended = observed - (fastEWMA - mean)
+		}
+
 		var score float64
 		usedMAD := false
 		if useMAD && mad > 1e-9 {
 			usedMAD = true
-			score = 0.6745 * (observed - median) / mad
+			score = 0.6745 * (detrended - median) / mad
 		} else {
 			effStdDev := stddev
 			if effStdDev < s.minStdDev {
 				effStdDev = s.minStdDev
 			}
-			score = (observed - mean) / effStdDev
+			score = (detrended - mean) / effStdDev
 		}
 
 		severity := ""
 		isAnomaly := math.Abs(score) > s.threshold
 		if isAnomaly {
-			severity = "warning"
+			base := "warning"
 			if math.Abs(score) > 5.0 {
-				severity = "critical"
+				base = "critical"
 			}
+			severity = s.severityFromConfidence(base, confidence, false)
 		}
 
 		results = append(results, Result{
-			Key:      key,
-			Observed: observed,
-			Mean:     mean,
-			StdDev:   stddev,
-			ZScore:   score,
-			Anomaly:  isAnomaly,
-			Severity: severity,
-			UsedMAD:  usedMAD,
+			Key:        key,
+			Observed:   observed,
+			Mean:       mean,
+			StdDev:     stddev,
+			ZScore:     score,
+			Anomaly:    isAnomaly,
+			Severity:   severity,
+			UsedMAD:    usedMAD,
+			Confidence: confidence,
 		})
 	}
 
@@ -161,7 +182,7 @@ func (s *Scorer) Score(w *aggregator.Window) []Result {
 		if s.engine.InFastTrack(dk, w.Start) {
 			continue
 		}
-		mean, stddev, _, ready := s.engine.Lookup(dk, hour, dow)
+		mean, stddev, _, _, confidence, ready := s.engine.Lookup(dk, hour, dow)
 		if !ready || mean < 1.0 {
 			continue
 		}
@@ -174,23 +195,92 @@ func (s *Scorer) Score(w *aggregator.Window) []Result {
 		zscore := -mean / effStdDev
 
 		if math.Abs(zscore) > s.threshold {
-			severity := "warning"
+			base := "warning"
 			if math.Abs(zscore) > 5.0 {
-				severity = "critical"
+				base = "critical"
 			}
 			results = append(results, Result{
-				Key:      dk,
-				Observed: 0,
-				Mean:     mean,
-				StdDev:   stddev,
-				ZScore:   zscore,
-				Anomaly:  true,
-				Severity: severity,
+				Key:        dk,
+				Observed:   0,
+				Mean:       mean,
+				StdDev:     stddev,
+				ZScore:     zscore,
+				Anomaly:    true,
+				Severity:   s.severityFromConfidence(base, confidence, false),
+				Confidence: confidence,
 			})
 		}
 	}
 
 	return results
+}
+
+func (s *Scorer) ceilingTriggered(key aggregator.DimensionKey, observed float64, hour, dow int) bool {
+	if ceiling, ok := s.ceilings[key.MetricName]; ok && ceiling > 0 && observed > ceiling {
+		return true
+	}
+	if s.ceilingMultiplier > 0 {
+		mean, _, _, _, _, ready := s.engine.Lookup(key, hour, dow)
+		if ready && mean > 0 && observed > mean*s.ceilingMultiplier {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Scorer) bucketConfidence(key aggregator.DimensionKey, hour, dow int) float64 {
+	_, _, _, _, conf, ready := s.engine.Lookup(key, hour, dow)
+	if !ready {
+		return 0
+	}
+	return conf
+}
+
+func (s *Scorer) severityFromConfidence(base string, confidence float64, coldStart bool) string {
+	if coldStart {
+		return s.adjustColdStartSeverity(base)
+	}
+	if confidence < 0.35 {
+		if base == "critical" {
+			return "warning"
+		}
+		return "info"
+	}
+	if confidence < 0.6 && base == "critical" {
+		return "warning"
+	}
+	return base
+}
+
+func (s *Scorer) adjustColdStartSeverity(sev string) string {
+	return "info"
+}
+
+func (s *Scorer) inMaintenanceWindow(t time.Time) bool {
+	if len(s.maintenanceWindows) == 0 {
+		return false
+	}
+	day := strings.ToLower(t.Weekday().String())[:3]
+	hour := t.Hour()
+	for _, w := range s.maintenanceWindows {
+		if !windowDayMatch(w.Days, day) {
+			continue
+		}
+		if hour >= w.StartHour && hour < w.EndHour {
+			return true
+		}
+	}
+	return false
+}
+
+func windowDayMatch(days []string, day string) bool {
+	for _, d := range days {
+		d = strings.ToLower(strings.TrimSpace(d))
+		if d == "*" || d == day {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Scorer) Threshold() float64 {

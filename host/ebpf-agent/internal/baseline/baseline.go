@@ -17,16 +17,18 @@ const ObsRingSize = 32
 
 // BucketStats holds running statistics for a single seasonal bucket.
 type BucketStats struct {
-	Count    int
-	Sum      float64
-	SumSq    float64
-	Min      float64
-	Max      float64
-	EWMA     float64
-	EWMAVar  float64
-	EWMAInit bool
-	ObsRing  [ObsRingSize]float64
-	ObsCount int
+	Count       int
+	Sum         float64
+	SumSq       float64
+	Min         float64
+	Max         float64
+	EWMA        float64
+	EWMAVar     float64
+	FastEWMA    float64
+	FastEWMAInit bool
+	EWMAInit    bool
+	ObsRing     [ObsRingSize]float64
+	ObsCount    int
 }
 
 func (b *BucketStats) Mean() float64 {
@@ -128,22 +130,47 @@ type DimensionBaseline struct {
 
 // Engine manages baselines for all dimensions.
 type Engine struct {
-	alpha            float64
-	minSample        int
-	fastTrackWindow  time.Duration
-	mu               sync.RWMutex
-	baselines        map[aggregator.DimensionKey]*DimensionBaseline
-	fastTrackStarted map[aggregator.DimensionKey]time.Time
+	alpha                 float64
+	fastAlpha             float64
+	minSample             int
+	fastTrackWindow       time.Duration
+	holdHighSeverity      bool
+	mu                    sync.RWMutex
+	baselines             map[aggregator.DimensionKey]*DimensionBaseline
+	fastTrackStarted      map[aggregator.DimensionKey]time.Time
+	heldFastTrack         map[aggregator.DimensionKey]struct{}
+	heldFastTrackMetrics  map[string]struct{}
+	highSeveritySeen      map[aggregator.DimensionKey]struct{}
 }
 
 func NewEngine(ewmaAlpha float64, minSamples int) *Engine {
 	return &Engine{
 		alpha:            ewmaAlpha,
+		fastAlpha:        0.1,
 		minSample:        minSamples,
 		fastTrackWindow:  24 * time.Hour,
+		holdHighSeverity: true,
 		baselines:        make(map[aggregator.DimensionKey]*DimensionBaseline),
 		fastTrackStarted: make(map[aggregator.DimensionKey]time.Time),
+		heldFastTrack:        make(map[aggregator.DimensionKey]struct{}),
+		heldFastTrackMetrics: make(map[string]struct{}),
+		highSeveritySeen:     make(map[aggregator.DimensionKey]struct{}),
 	}
+}
+
+func (e *Engine) SetFastTrendAlpha(a float64) {
+	if a <= 0 || a >= 1 {
+		return
+	}
+	e.mu.Lock()
+	e.fastAlpha = a
+	e.mu.Unlock()
+}
+
+func (e *Engine) SetHoldHighSeverityFastTrack(hold bool) {
+	e.mu.Lock()
+	e.holdHighSeverity = hold
+	e.mu.Unlock()
 }
 
 func (e *Engine) SetFastTrackWindow(d time.Duration) {
@@ -178,7 +205,50 @@ func (e *Engine) InFastTrack(key aggregator.DimensionKey, at time.Time) bool {
 }
 
 func (e *Engine) ShouldIngestColdStart(key aggregator.DimensionKey, at time.Time) bool {
-	return e.InFastTrack(key, at)
+	if e.InFastTrack(key, at) {
+		return !e.isHeldFastTrack(key)
+	}
+	return false
+}
+
+func (e *Engine) isHeldFastTrack(key aggregator.DimensionKey) bool {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if _, held := e.heldFastTrack[key]; held {
+		return true
+	}
+	_, held := e.heldFastTrackMetrics[key.MetricName]
+	return held
+}
+
+// MarkHighSeverityDimension prevents fast-track ingest for suspicious new dimensions.
+func (e *Engine) MarkHighSeverityDimension(key aggregator.DimensionKey) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.highSeveritySeen[key] = struct{}{}
+	if key.MetricName != "" {
+		e.heldFastTrackMetrics[key.MetricName] = struct{}{}
+	}
+	if e.holdHighSeverity {
+		e.heldFastTrack[key] = struct{}{}
+	}
+}
+
+// MarkHighSeverityMetric holds all cold-start dimensions for a metric name.
+func (e *Engine) MarkHighSeverityMetric(metric string) {
+	if metric == "" {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.heldFastTrackMetrics[metric] = struct{}{}
+}
+
+// ClearFastTrackHold removes ingest hold after fast-track window if dimension normalized.
+func (e *Engine) ClearFastTrackHold(key aggregator.DimensionKey) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	delete(e.heldFastTrack, key)
 }
 
 // SeasonalIndex computes the 0–167 bucket from wall clock time.
@@ -201,10 +271,18 @@ func (e *Engine) updateBucket(b *BucketStats, value float64) {
 		b.EWMA = value
 		b.EWMAVar = 0
 		b.EWMAInit = true
+		b.FastEWMA = value
+		b.FastEWMAInit = true
 	} else {
 		diff := value - b.EWMA
 		b.EWMA = e.alpha*value + (1-e.alpha)*b.EWMA
 		b.EWMAVar = e.alpha*diff*diff + (1-e.alpha)*b.EWMAVar
+		if !b.FastEWMAInit {
+			b.FastEWMA = value
+			b.FastEWMAInit = true
+		} else {
+			b.FastEWMA = e.fastAlpha*value + (1-e.fastAlpha)*b.FastEWMA
+		}
 	}
 
 	pushObsRing(&b.ObsRing, &b.ObsCount, value)
@@ -242,10 +320,12 @@ func (e *Engine) IngestFiltered(w *aggregator.Window, skip map[aggregator.Dimens
 }
 
 type LookupResult struct {
-	Mean   float64
-	StdDev float64
-	EWMA   float64
-	Ready  bool
+	Mean      float64
+	StdDev    float64
+	EWMA      float64
+	FastEWMA  float64
+	Ready     bool
+	Confidence float64 // 0..1 bucket sample confidence
 }
 
 func (e *Engine) bucketAt(bl *DimensionBaseline, idx int) *BucketStats {
@@ -263,11 +343,50 @@ func (e *Engine) lookupBucket(b *BucketStats) LookupResult {
 	if stddev <= 0 {
 		stddev = b.StdDev()
 	}
+	conf := float64(b.Count) / float64(e.minSample*3)
+	if conf > 1 {
+		conf = 1
+	}
 	return LookupResult{
-		Mean:   b.EWMA,
-		StdDev: stddev,
-		EWMA:   b.EWMA,
-		Ready:  true,
+		Mean:       b.EWMA,
+		StdDev:     stddev,
+		EWMA:       b.EWMA,
+		FastEWMA:   b.FastEWMA,
+		Ready:      true,
+		Confidence: conf,
+	}
+}
+
+func (e *Engine) globalFallback(bl *DimensionBaseline) LookupResult {
+	var sumMean, sumStd, sumEWMA, sumFast float64
+	var count int
+	var totalSamples int
+	for i := range bl.Buckets {
+		b := &bl.Buckets[i]
+		totalSamples += b.Count
+		if res := e.lookupBucket(b); res.Ready {
+			sumMean += res.Mean
+			sumStd += res.StdDev
+			sumEWMA += res.EWMA
+			sumFast += res.FastEWMA
+			count++
+		}
+	}
+	if count == 0 {
+		return LookupResult{Ready: false}
+	}
+	f := float64(count)
+	conf := float64(totalSamples) / float64(e.minSample*HourlyBuckets)
+	if conf > 1 {
+		conf = 1
+	}
+	return LookupResult{
+		Mean:       sumMean / f,
+		StdDev:     sumStd / f,
+		EWMA:       sumEWMA / f,
+		FastEWMA:   sumFast / f,
+		Ready:      true,
+		Confidence: conf * 0.5,
 	}
 }
 
@@ -287,46 +406,37 @@ func (e *Engine) lookupWithFallback(bl *DimensionBaseline, idx int) LookupResult
 		return res
 	}
 
-	var sumMean, sumStd, sumEWMA float64
+	var sumMean, sumStd, sumEWMA, sumFast float64
 	var count int
 	for _, n := range neighborIndices(idx) {
 		if res := e.lookupBucket(e.bucketAt(bl, n)); res.Ready {
 			sumMean += res.Mean
 			sumStd += res.StdDev
 			sumEWMA += res.EWMA
+			sumFast += res.FastEWMA
 			count++
 		}
 	}
 	if count == 0 {
-		return LookupResult{Ready: false}
+		return e.globalFallback(bl)
 	}
 	f := float64(count)
+	conf := float64(count) / 4.0
+	if conf > 1 {
+		conf = 1
+	}
 	return LookupResult{
-		Mean:   sumMean / f,
-		StdDev: sumStd / f,
-		EWMA:   sumEWMA / f,
-		Ready:  true,
+		Mean:       sumMean / f,
+		StdDev:     sumStd / f,
+		EWMA:       sumEWMA / f,
+		FastEWMA:   sumFast / f,
+		Ready:      true,
+		Confidence: conf * 0.75,
 	}
 }
 
 // Lookup returns EWMA-blended stats for a dimension at a given seasonal index.
-func (e *Engine) Lookup(key aggregator.DimensionKey, hour, dow int) (mean, stddev, ewma float64, ready bool) {
-	idx := SeasonalIndex(hour, dow)
-
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-
-	bl, ok := e.baselines[key]
-	if !ok {
-		return 0, 0, 0, false
-	}
-
-	res := e.lookupWithFallback(bl, idx)
-	return res.Mean, res.StdDev, res.EWMA, res.Ready
-}
-
-// LookupRobust returns EWMA stats plus median/MAD from the observation ring.
-func (e *Engine) LookupRobust(key aggregator.DimensionKey, hour, dow int) (mean, stddev, ewma, median, mad float64, ready bool) {
+func (e *Engine) Lookup(key aggregator.DimensionKey, hour, dow int) (mean, stddev, ewma, fastEWMA float64, confidence float64, ready bool) {
 	idx := SeasonalIndex(hour, dow)
 
 	e.mu.RLock()
@@ -337,6 +447,22 @@ func (e *Engine) LookupRobust(key aggregator.DimensionKey, hour, dow int) (mean,
 		return 0, 0, 0, 0, 0, false
 	}
 
+	res := e.lookupWithFallback(bl, idx)
+	return res.Mean, res.StdDev, res.EWMA, res.FastEWMA, res.Confidence, res.Ready
+}
+
+// LookupRobust returns EWMA stats plus median/MAD from the observation ring.
+func (e *Engine) LookupRobust(key aggregator.DimensionKey, hour, dow int) (mean, stddev, ewma, fastEWMA, median, mad float64, confidence float64, ready bool) {
+	idx := SeasonalIndex(hour, dow)
+
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	bl, ok := e.baselines[key]
+	if !ok {
+		return 0, 0, 0, 0, 0, 0, 0, false
+	}
+
 	b := e.bucketAt(bl, idx)
 	if b != nil {
 		median = b.medianObs()
@@ -344,7 +470,7 @@ func (e *Engine) LookupRobust(key aggregator.DimensionKey, hour, dow int) (mean,
 	}
 
 	res := e.lookupWithFallback(bl, idx)
-	return res.Mean, res.StdDev, res.EWMA, median, mad, res.Ready
+	return res.Mean, res.StdDev, res.EWMA, res.FastEWMA, median, mad, res.Confidence, res.Ready
 }
 
 // LookupSkewness returns sample skewness for the seasonal bucket observation ring.
@@ -442,6 +568,8 @@ func (e *Engine) Restore(snaps []DimensionSnapshot) {
 				sd := b.StdDev()
 				b.EWMAVar = sd * sd
 				b.EWMAInit = true
+				b.FastEWMA = b.EWMA
+				b.FastEWMAInit = true
 			}
 		}
 		e.baselines[s.Key] = bl
