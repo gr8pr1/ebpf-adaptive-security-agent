@@ -44,7 +44,7 @@ sudo ./ebpf-agent
 4. **Aggregator**: Add the event type mapping in `internal/aggregator/aggregator.go`.
 5. **MITRE Mapper**: Add the technique mapping in `internal/mitre/mitre.go`.
 6. **Tests**: Update `internal/config/config_test.go`.
-7. **Docs**: Update `README.md`, `ARCHITECTURE.md`, and log the change in `state.md`.
+7. **Docs**: Update `README.md`, [DESIGN.md](DESIGN.md), and log internal changes in `state.md` (local).
 
 ## Testing
 

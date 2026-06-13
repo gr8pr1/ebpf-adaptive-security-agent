@@ -7,6 +7,8 @@
 
 A host-adapting security monitoring agent that uses eBPF to learn normal system behavior and detect anomalies. The agent operates in two phases: it first establishes per-host baselines through statistical analysis, then monitors for deviations using z-score anomaly detection with context-aware MITRE ATT&CK mapping.
 
+**Design document:** [DESIGN.md](DESIGN.md) — public architecture reference, implementation status, and roadmap.
+
 ## How It Works
 
 The agent attaches eBPF programs to kernel tracepoints to observe syscalls at the kernel level. Events flow through a structured pipeline:
@@ -319,7 +321,7 @@ Bug Fix Sprint — correctness and detection reliability:
 | **Persistence** | SQLite WAL + busy_timeout; state file chmod 0600 on save |
 | **Tests** | `phase`, `baseline`, `otelexport`, `mitre` unit tests |
 
-Full internal changelog: `state.md` (local, not in git). Step-by-step guide: `local/HOW_IT_WORKS.md` (local, not in git).
+Full internal changelog: `state.md` (local, not in git). Public design reference: [DESIGN.md](DESIGN.md). Step-by-step guide: `local/HOW_IT_WORKS.md` (local, not in git).
 
 ## Contributing
 
